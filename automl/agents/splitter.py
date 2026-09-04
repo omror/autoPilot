@@ -1,6 +1,5 @@
 """Train/test ayrimi."""
 from sklearn.model_selection import train_test_split
-
 from automl.agents.base import Agent
 from automl.schemas import RunState
 

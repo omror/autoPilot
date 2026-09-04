@@ -1,4 +1,4 @@
-"""Plani sklearn Pipeline'a cevirir ve uygular."""
+"""Planı sklearn Pipeline'a cevirir ve uygular."""
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer

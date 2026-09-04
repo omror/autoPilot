@@ -16,7 +16,6 @@ from automl.schemas import RunResult, RunState
 
 def _gini_coefficient(model, X_te, y_te) -> float | None:
     """Gini katsayisi (2*AUC - 1): kredi skorlamada yaygin metrik.
-
     0 = rastgele tahmin, 1 = mukemmel ayirim. Sadece ikili
     siniflandirmada anlamli oldugu icin diger durumlarda None doner.
     """
