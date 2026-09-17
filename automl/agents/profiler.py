@@ -135,14 +135,28 @@ def _high_correlations(df: pd.DataFrame, cols: list[str],
     return ciftler[:15]
 
 
-# Sinif dengesizligi: en kucuk sinifin orani bu esigin ALTINDAYSA veri
-# dengesiz sayilir. Gerekce: f1_weighted her sinifi buyuklugu kadar
-# agirliklandirir. Hep cogunluk sinifini soyleyen model ikili veride
-# azinlik orani p iken f1_weighted = (1-p) * 2(1-p)/(2-p) alir:
-# p=0.15'te 0.78, p=0.137'de 0.80 (classification iterasyon esigi),
-# p=0.10'da 0.85. Yani yaygin %10 esigi, hicbir sey ogrenmeyen modelin
-# esigi gectigi %10-%13.7 araligini kacirirdi; %15 bu boslugu kapatir.
-DENGESIZLIK_ESIGI = 0.15
+# Sinif dengesizligi: en kucuk sinifin orani, dengeli dagilimda bekledigi
+# payin (1/K) bu kesrinin ALTINDAYSA veri dengesiz sayilir:
+#     esik = DENGESIZLIK_ORANI * (1 / K)
+# Esik sinif sayisiyla olceklenir; mutlak bir esik cok sinifli dengeli
+# veride yanilirdi (8 dengeli sinifin her biri %12.5 pay alir).
+# Oranin gerekcesi ikili veriden gelir (K=2 -> esik 0.15): hep cogunluk
+# sinifini soyleyen model azinlik orani p iken f1_weighted =
+# (1-p) * 2(1-p)/(2-p) alir: p=0.15'te 0.78, p=0.137'de 0.80
+# (classification iterasyon esigi), p=0.10'da 0.85. Yaygin %10 esigi,
+# hicbir sey ogrenmeyen modelin esigi gectigi %10-%13.7 araligini
+# kacirirdi; %15 bu boslugu kapatir.
+DENGESIZLIK_ORANI = 0.30
+
+
+def dengesizlik_esigi(k: int) -> float:
+    "K sinifli veride azinlik sinifi icin dengesizlik esigi."
+    return DENGESIZLIK_ORANI * (1 / k)
+
+
+def _yuzde(x: float) -> str:
+    "Esik gibi veriye gore degisen oranlari kisa yuzde olarak yazar."
+    return f"%{x * 100:.3g}"
 
 
 def _cogunluk_modeli_skorlari(oranlar: dict[str, float]) -> tuple[float, float]:
@@ -157,16 +171,25 @@ def _cogunluk_modeli_skorlari(oranlar: dict[str, float]) -> tuple[float, float]:
     return p_max * f1_cogunluk, f1_cogunluk / len(oranlar)
 
 
-def esik_gerekcesi() -> str:
-    "DENGESIZLIK_ESIGI neden bu deger? Metin sabitin kendisinden uretilir."
-    p = DENGESIZLIK_ESIGI
-    w, m = _cogunluk_modeli_skorlari({"cogunluk": 1 - p, "azinlik": p})
+def esik_gerekcesi(k: int) -> str:
+    """Esik neden bu deger? Metin sabitin kendisinden uretilir.
+
+    k: verideki sinif sayisi; hesaplanan esik metinde gorunur.
+    """
+    ikili = dengesizlik_esigi(2)
+    w, m = _cogunluk_modeli_skorlari({"cogunluk": 1 - ikili,
+                                      "azinlik": ikili})
     return (
-        f"f1_weighted her sınıfı büyüklüğü kadar ağırlıklandırır. İkili "
-        f"veride azınlık oranı tam DENGESIZLIK_ESIGI (%{p * 100:g}) iken "
-        f"bile hep çoğunluk sınıfını söyleyen model f1_weighted={w:.2f} "
-        f"alır (f1_macro={m:.2f}). Azınlık küçüldükçe bu skor 1'e yaklaşır; "
-        f"eşiğin altında f1_weighted azınlık sınıfını fiilen göremez."
+        f"Eşik sınıf sayısıyla ölçeklenir: eşik = DENGESIZLIK_ORANI "
+        f"({_yuzde(DENGESIZLIK_ORANI)}) × 1/K. Dengeli dağılımda her sınıf "
+        f"1/K pay alır; sabit bir eşik çok sınıflı dengeli veriyi yanlışlıkla "
+        f"dengesiz sayardı. Bu veride K={k}: beklenen pay "
+        f"{_yuzde(1 / k)}, eşik {_yuzde(dengesizlik_esigi(k))}. Oran ikili "
+        f"veriden gelir: K=2'de eşik {_yuzde(ikili)} ve azınlık tam bu "
+        f"orandayken bile hep çoğunluk sınıfını söyleyen model "
+        f"f1_weighted={w:.2f} alır (f1_macro={m:.2f}). Azınlık küçüldükçe "
+        f"bu skor 1'e yaklaşır; eşiğin altında f1_weighted azınlık sınıfını "
+        f"fiilen göremez."
     )
 
 
@@ -174,26 +197,32 @@ def _dengesizlik(oranlar: dict[str, float]) -> dict:
     """Sinif dagilimindan dengesizlik alanlarini uretir.
 
     Cok sinifli veride de ayni kural gecerli: en kucuk sinifin oranina
-    bakilir.
+    bakilir, esik sinif sayisina gore olceklenir.
     """
     if not oranlar:
         return {}
     azinlik = min(oranlar, key=lambda k: oranlar[k])
     cogunluk = max(oranlar, key=lambda k: oranlar[k])
     p_min, p_max = oranlar[azinlik], oranlar[cogunluk]
-    dengesiz = p_min < DENGESIZLIK_ESIGI
-    esik = f"(DENGESIZLIK_ESIGI = %{DENGESIZLIK_ESIGI * 100:g})"
+    k = len(oranlar)
+    esik_degeri = dengesizlik_esigi(k)
+    dengesiz = p_min < esik_degeri
+    esik = (f"(K={k} sınıf, eşik = DENGESIZLIK_ORANI "
+            f"{_yuzde(DENGESIZLIK_ORANI)} × 1/{k} = {_yuzde(esik_degeri)})")
 
     if dengesiz:
-        w, m = _cogunluk_modeli_skorlari(oranlar)
+        # Azinlik sinifinin F1'i 0, digerleri en iyi ihtimalle 1 olsa:
+        # f1_weighted <= 1 - p_min, f1_macro <= (K-1)/K. Her K icin gecerli.
         gerekce = (
             f"En küçük sınıf '{azinlik}': oran %{p_min * 100:.2f}, eşiğin "
-            f"altında {esik}. Hiçbir şey öğrenmeyip hep '{cogunluk}' diyen "
-            f"model bu dağılımda f1_weighted={w:.4f} alır; azınlık sınıfının "
-            f"tamamını kaçırmasına rağmen. f1_macro sınıflara eşit ağırlık "
-            f"verir: aynı model f1_macro={m:.4f} alır, azınlık sınıfındaki "
-            f"başarısızlık skora yansır. Bu yüzden CV, test ve iterasyon "
-            f"eşiği f1_weighted yerine f1_macro ile değerlendirilir."
+            f"altında {esik}. f1_weighted her sınıfı payı kadar "
+            f"ağırlıklandırır: '{azinlik}' skora %{p_min * 100:.2f} ağırlıkla "
+            f"girer, f1_macro'da ise 1/K = {_yuzde(1 / k)} ağırlıkla. Bu "
+            f"sınıfı tamamen kaçıran bir model f1_weighted ile yine de "
+            f"{1 - p_min:.4f} kadar yüksek skor alabilir; f1_macro ile en "
+            f"fazla {(k - 1) / k:.4f} alır, kaçırılan sınıf skora yansır. Bu "
+            f"yüzden CV, test ve iterasyon eşiği f1_weighted yerine f1_macro "
+            f"ile değerlendirilir."
         )
     else:
         gerekce = (
@@ -206,6 +235,7 @@ def _dengesizlik(oranlar: dict[str, float]) -> dict:
         "imbalance_ratio": p_max / p_min,
         "minority_class": azinlik,
         "minority_ratio": p_min,
+        "imbalance_threshold": esik_degeri,
         "imbalance_reason": gerekce,
     }
 

@@ -51,11 +51,13 @@ class DataProfile(_Strict):
     class_balance: Optional[dict[str,float]] = None
     high_correlations: list[tuple[str, str, float]] = []
     # Sinif dengesizligi (sadece classification'da dolu). Karar profiler'da
-    # DENGESIZLIK_ESIGI ile verilir; metrik secimi buna gore degisir.
+    # DENGESIZLIK_ORANI * (1/K) esigiyle verilir; metrik secimi buna gore
+    # degisir.
     is_imbalanced: bool = False
     imbalance_ratio: Optional[float] = None   # cogunluk / azinlik
     minority_class: Optional[str] = None
     minority_ratio: Optional[float] = None
+    imbalance_threshold: Optional[float] = None   # sinif sayisina gore
     imbalance_reason: str = ""
 
 

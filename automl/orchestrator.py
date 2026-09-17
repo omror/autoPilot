@@ -4,7 +4,7 @@ import time
 from automl.schemas import (ColumnDecision, ColumnProfile, DataProfile,
                             PreprocessingPlan, RunState)
 from automl.agents.loader import LoaderAgent
-from automl.agents.profiler import (DENGESIZLIK_ESIGI, ProfilerAgent,
+from automl.agents.profiler import (DENGESIZLIK_ORANI, ProfilerAgent,
                                     ana_metrik, esik_gerekcesi)
 from automl.agents.splitter import SplitterAgent
 from automl.agents.planner import PlannerAgent
@@ -130,12 +130,15 @@ def _dengesizlik_yaz(p: DataProfile) -> None:
         print(f"    {sinif[:20]:20} %{oran * 100:6.2f}  "
               f"({round(oran * dolu)} satır){isaret}")
     satir("oran", f"{p.imbalance_ratio:.1f} : 1 (çoğunluk / azınlık)")
+    k = len(p.class_balance or {})
+    esik = p.imbalance_threshold or 0.0
     satir("azınlık", f"'{p.minority_class}' %{p.minority_ratio * 100:.2f} "
-                     f"< DENGESIZLIK_ESIGI %{DENGESIZLIK_ESIGI * 100:g}")
+                     f"< eşik %{esik * 100:.3g} (K={k} sınıf: "
+                     f"DENGESIZLIK_ORANI %{DENGESIZLIK_ORANI * 100:g} × 1/{k})")
     satir("metrik", f"f1_weighted -> {ana_metrik(p)} (CV, test ve "
                     f"iterasyon eşiği)")
     satir("neden", p.imbalance_reason)
-    satir("eşik", esik_gerekcesi())
+    satir("eşik", esik_gerekcesi(k))
     satir("modeller", "havuza class_weight='balanced' varyantları eklendi "
                       "(LogisticRegression, RandomForest); mevcutlar da "
                       "kaldı, CV karşılaştırır")

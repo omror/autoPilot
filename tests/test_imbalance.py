@@ -10,7 +10,8 @@ import pytest
 from automl.agents import profiler
 from automl.agents.evaluator import BASELINE_FARK_ESIGI, _baseline_karsilastir
 from automl.agents.modeler import _candidate_models
-from automl.agents.profiler import DENGESIZLIK_ESIGI, ana_metrik, profile
+from automl.agents.profiler import (DENGESIZLIK_ORANI, ana_metrik,
+                                    dengesizlik_esigi, profile)
 from automl.schemas import ModelScore, RunState
 
 IRIS = "data/iris.csv"
@@ -86,7 +87,7 @@ def test_titanic_gibi_hafif_dengesizlik_dengeli_sayilir():
 def test_esik_siniri_kesin_kucuktur():
     "Oran tam esige esitse dengeli, bir ornek eksikse dengesiz."
     n = 1000
-    tam = round(n * DENGESIZLIK_ESIGI)
+    tam = round(n * dengesizlik_esigi(2))
     esitte = _profil(_siniflar({0: n - tam, 1: tam}), "hedef")
     altinda = _profil(_siniflar({0: n - tam + 1, 1: tam - 1}), "hedef")
     assert not esitte.is_imbalanced
@@ -105,13 +106,54 @@ def test_regression_dengesizlik_alanlari_bos():
     assert p.imbalance_ratio is None
 
 
-def test_gerekce_metinleri_esik_sabitini_kullanir(monkeypatch):
-    "Esik degisirse gerekce metni de ayni sabitten guncellenmeli."
-    monkeypatch.setattr(profiler, "DENGESIZLIK_ESIGI", 0.10)
-    p = _profil(_siniflar({0: 880, 1: 120}), "hedef")   # %12
+def test_ikili_veride_esik_hala_yuzde_15():
+    "Olceklenen esik ikili veride eski mutlak esikle (0.15) ayni kalmali."
+    assert DENGESIZLIK_ORANI == 0.30
+    assert dengesizlik_esigi(2) == 0.15
+    p = _profil(_siniflar({0: 950, 1: 50}), "hedef")
+    assert p.imbalance_threshold == 0.15
+    assert "K=2" in p.imbalance_reason
+    assert "%15" in p.imbalance_reason
+
+
+def test_sekiz_sinifli_dengeli_veri_dengeli_sayilir():
+    "Her sinif %12.5: mutlak %15 esigi yanilirdi, olceklenen esik %3.75."
+    p = _profil(_siniflar({s: 125 for s in "abcdefgh"}), "hedef")
+    assert p.minority_ratio == pytest.approx(0.125)
+    assert p.imbalance_threshold == pytest.approx(0.0375)
     assert not p.is_imbalanced
-    assert "%10" in p.imbalance_reason
-    assert "%10" in profiler.esik_gerekcesi()
+    assert ana_metrik(p) == "f1_weighted"
+    assert "K=8" in p.imbalance_reason
+    assert "%3.75" in p.imbalance_reason
+
+
+def test_sekiz_sinifli_dengesiz_veri_yakalanir():
+    "8 sinifta bir sinif %2 ise (esik %3.75) dengesiz sayilmali."
+    sayimlar = {s: 140 for s in "abcdefg"}
+    sayimlar["h"] = 20
+    p = _profil(_siniflar(sayimlar), "hedef")
+    assert p.minority_class == "h"
+    assert p.minority_ratio == pytest.approx(0.02)
+    assert p.is_imbalanced
+    assert ana_metrik(p) == "f1_macro"
+    assert "K=8" in p.imbalance_reason
+    assert "%3.75" in p.imbalance_reason
+    # Gerekce sinif sayisina gore: azinligi kaciran model f1_weighted ile
+    # 0.98'e cikabilir, f1_macro ile en fazla 7/8.
+    assert "0.9800" in p.imbalance_reason
+    assert "0.8750" in p.imbalance_reason
+
+
+def test_gerekce_metinleri_oran_sabitini_kullanir(monkeypatch):
+    "Oran degisirse hesaplanan esik ve gerekce metni de guncellenmeli."
+    monkeypatch.setattr(profiler, "DENGESIZLIK_ORANI", 0.20)
+    p = _profil(_siniflar({0: 880, 1: 120}), "hedef")   # %12, esik %10
+    assert p.imbalance_threshold == pytest.approx(0.10)
+    assert not p.is_imbalanced
+    assert "%20" in p.imbalance_reason and "%10" in p.imbalance_reason
+    metin = profiler.esik_gerekcesi(4)
+    assert "%20" in metin
+    assert "K=4" in metin and "eşik %5." in metin
 
 
 # --- 2) Metrik secimi ve model havuzu -----------------------------------
