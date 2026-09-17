@@ -3,10 +3,10 @@ from automl import llm
 from automl.agents.base import Agent
 # ID orani profiler'da test ediliyor, esik de orada tanimli: gerekce
 # metninde ayni sabit kullanilsin ki basilan esik koddan sapmasin.
-from automl.agents.profiler import ID_ORAN_ESIGI
+from automl.agents.profiler import GIZLI_SAYISAL_ESIGI, ID_ORAN_ESIGI
 from automl.memory.store import benzer_runlar
-from automl.schemas import (ColumnDecision, DataProfile, PreprocessingPlan,
-                            RunState)
+from automl.schemas import (ColumnDecision, ColumnProfile, DataProfile,
+                            PreprocessingPlan, RunState)
 
 SYSTEM_PROMPT = (
     "Sen bir ML preprocessing uzmanisin. Verilen veri profiline bakarak "
@@ -53,6 +53,21 @@ def _pca_gerekcesi(n_sayisal: int, n_satir: int, use_pca: bool,
         sebepler.append(f"{n_satir} satır, eşik "
                         f"{PCA_SATIR_ESIGI}'nin üzerinde değil")
     return "kapalı — " + "; ".join(sebepler)
+
+
+def _donusum_gerekcesi(c: ColumnProfile) -> tuple[str, str]:
+    "Metin tipinde gelip sayiya cevrilen kolonun (sebep, tetik) metni."
+    oran = c.donusum_orani or 0.0
+    sebep = (f"metin tipinde (dtype={c.ham_dtype}) geldi ama değerleri "
+             f"sayı: gizli sayısal kolon, sayıya çevrilip sayısal "
+             f"pipeline'a gider")
+    tetik = (f"sayıya çevrilebilen dolu değer oranı %{oran * 100:.1f} >= "
+             f"GIZLI_SAYISAL_ESIGI %{GIZLI_SAYISAL_ESIGI * 100:g}")
+    if c.n_donusmeyen:
+        ornekler = ", ".join(c.donusmeyen_ornekler)
+        tetik += (f"; {c.n_donusmeyen} değer ({ornekler}) eksik sayılıp "
+                  f"imputation'a bırakıldı")
+    return sebep, tetik
 
 
 def plan(state: RunState) -> RunState:
@@ -143,12 +158,15 @@ def plan(state: RunState) -> RunState:
 
         if c.inferred_type == "numeric":
             numeric_cols.append(c.name)
+            if c.donusturuldu:
+                sebep, tetik = _donusum_gerekcesi(c)
+            else:
+                sebep = "sayısal tip, sayısal pipeline'a gider"
+                tetik = (f"null oranı %{c.null_ratio*100:.0f}, "
+                         f"{null_esik_metni} altında")
             kararlar.append(ColumnDecision(
                 name=c.name, inferred_type=c.inferred_type,
-                decision="numeric",
-                reason="sayısal tip, sayısal pipeline'a gider",
-                trigger=f"null oranı %{c.null_ratio*100:.0f}, "
-                        f"{null_esik_metni} altında",
+                decision="numeric", reason=sebep, trigger=tetik,
             ))
         else:
             categorical_cols.append(c.name)

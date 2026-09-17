@@ -11,13 +11,53 @@ from automl.schemas import (
 )
 
 
+# Gizli sayisal kolon: metin tipinde gelen kolonun dolu degerlerinin en az
+# bu orani sayiya cevrilebiliyorsa kolon aslinda sayisaldir. CSV'de eksik
+# deger bazen " ", "-", "?" gibi yazilir; pandas bunlar yuzunden tum kolonu
+# metin okur. Kalan kucuk pay (%10'a kadar) eksik deger sayilir.
+GIZLI_SAYISAL_ESIGI = 0.90
+
+
+def _metin_tipi_mi(s: pd.Series) -> bool:
+    return bool(pd.api.types.is_object_dtype(s)
+                or pd.api.types.is_string_dtype(s))
+
+
+def _sayiya_cevir(s: pd.Series) -> pd.Series:
+    """Degerleri sayiya cevirir; cevrilemeyenler NaN olur.
+
+    Sonsuz degerler de ("inf") NaN sayilir: sklearn sonsuzu kabul etmez.
+    """
+    sayi = pd.Series(pd.to_numeric(s, errors="coerce"), index=s.index,
+                     dtype="float64")
+    return sayi.where(np.isfinite(sayi))
+
+
+def _gizli_sayisal_orani(s: pd.Series) -> float | None:
+    "Metin kolonunun dolu degerlerinin kaci sayiya cevrilebiliyor?"
+    if not _metin_tipi_mi(s):
+        return None
+    dolu = s.dropna()
+    if len(dolu) == 0:
+        return None
+    return float(_sayiya_cevir(dolu).notna().mean())
+
+
 def _detect_type(s: pd.Series, n_rows:int) -> InferredType:
     "Bir kolonun gerçek tipini otomatik olarak tespit eder."
 
     if pd.api.types.is_datetime64_any_dtype(s):
         return "datetime"
 
-    if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+    if _metin_tipi_mi(s):
+        # Gizli sayisal: once sayiya cevrilip NORMAL sayisal kurallara
+        # sokulur. Kural 2 az kardinalite yuzunden kategorik derse kolon
+        # asagidaki metin kurallariyla (orijinal degerleriyle) devam eder.
+        oran = _gizli_sayisal_orani(s)
+        if (oran is not None and oran >= GIZLI_SAYISAL_ESIGI
+                and _detect_type(_sayiya_cevir(s), n_rows) == "numeric"):
+            return "numeric"
+
         n_unique = s.nunique(dropna=True)
         if n_unique > 50 and n_unique / max(n_rows, 1) > 0.5:
             return "text"
@@ -40,6 +80,9 @@ def _detect_type(s: pd.Series, n_rows:int) -> InferredType:
         return "categorical" if clean.nunique() <= esik else "numeric"
 
     return "categorical"
+
+# Gerekce metninde gosterilecek en fazla cevrilemeyen deger ornegi.
+DONUSMEYEN_ORNEK = 5
 
 # Kimlik kolonu tespiti. Esikler ORANSAL: sabit sayi kullanilmaz ki
 # veri boyutundan bagimsiz calissin.
@@ -259,6 +302,28 @@ def profile(state: RunState) -> RunState:
     for name in df.columns:
         s = df[name]
         tip = _detect_type(s, n_rows)
+
+        # Metin tipinde gelip sayisal tespit edilen kolon df'te de sayiya
+        # cevrilir: split ve sklearn artik sayi gorur. Donusum satir bazli,
+        # veriden istatistik ogrenmez; cevrilemeyen degerler NaN olur ve
+        # imputation (sadece train'de fit edilir) doldurur.
+        donusum = {}
+        if tip == "numeric" and _metin_tipi_mi(s):
+            cevrilmis = _sayiya_cevir(s)
+            bozuk = s.notna() & cevrilmis.isna()
+            n_dolu = int(s.notna().sum())
+            donusum = {
+                "donusturuldu": True,
+                "ham_dtype": str(s.dtype),
+                "donusum_orani": float(cevrilmis.notna().sum() / n_dolu),
+                "n_donusmeyen": int(bozuk.sum()),
+                "donusmeyen_ornekler": [
+                    repr(v) for v in s[bozuk].unique()[:DONUSMEYEN_ORNEK]
+                ],
+            }
+            df[name] = cevrilmis
+            s = cevrilmis
+
         id_mi, id_ardisik = _probable_id(s, n_rows, tip)
 
         # Tipe gore ek istatistikler
@@ -277,6 +342,7 @@ def profile(state: RunState) -> RunState:
                 null_ratio=float(s.isna().mean()),
                 is_probable_id=id_mi,
                 id_ardisik=id_ardisik,
+                **donusum,
                 **ekstra,
             )
         )

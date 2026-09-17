@@ -74,10 +74,19 @@ def _kolon_notu(karar: ColumnDecision, c: ColumnProfile | None) -> str:
     if c is None:
         return karar.name
     if karar.decision == "numeric":
+        if c.donusturuldu:
+            return f"{karar.name} (sayıya çevrildi)"
         if c.null_ratio > 0:
             return f"{karar.name} (null %{c.null_ratio*100:.0f})"
         return karar.name
     return f"{karar.name} ({c.n_unique} eşsiz)"
+
+
+def _cevrildi_mi(karar: ColumnDecision,
+                 profil: dict[str, ColumnProfile]) -> bool:
+    "Kolon metin tipinde gelip sayiya cevrildi mi?"
+    c = profil.get(karar.name)
+    return c is not None and c.donusturuldu
 
 
 def _grup_yaz(baslik: str, islem: str, kararlar: list[ColumnDecision],
@@ -85,8 +94,10 @@ def _grup_yaz(baslik: str, islem: str, kararlar: list[ColumnDecision],
     "Ayni karari alan kolonlari tek blok halinde basar."
     print(f"  {baslik} ({len(kararlar)} kolon)")
     # Ayni gruptaki kolonlarin gerekcesi normalde aynidir; farkli gerekce
-    # varsa (LLM karari) hepsi ayri satirda gorunsun.
-    for sebep in dict.fromkeys(k.reason for k in kararlar):
+    # varsa (LLM karari) hepsi ayri satirda gorunsun. Sayiya cevrilen
+    # kolonlarin gerekcesi kendi bolumunde tek tek basildi.
+    for sebep in dict.fromkeys(k.reason for k in kararlar
+                               if not _cevrildi_mi(k, profil)):
         _etiketli_yaz("sebep", sebep)
     _etiketli_yaz("işlem", islem)
 
@@ -169,6 +180,18 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
                 _etiketli_yaz("tetik", k.trigger)
         else:
             print("\nATILAN KOLONLAR: yok, tum ozellikler kullanildi")
+
+        # Metin tipinde gelip sayiya cevrilenler tek tek: neden ve kac deger
+        # eksik sayildi gorunsun.
+        cevrilenler = [k for k in sayisallar if _cevrildi_mi(k, profil)]
+        if cevrilenler:
+            print(f"\nSAYIYA ÇEVRİLEN KOLONLAR ({len(cevrilenler)} kolon)")
+            for k in cevrilenler:
+                ham = profil[k.name].ham_dtype
+                print(f"  {k.name[:20]:20} [{ham} -> numeric]  SAYISAL "
+                      f"PIPELINE")
+                _etiketli_yaz("sebep", k.reason)
+                _etiketli_yaz("tetik", k.trigger)
 
         # Tutulanlar gruplu: 30 kolonlu veride ekrani bogmasin.
         print(f"\nTUTULAN KOLONLAR "

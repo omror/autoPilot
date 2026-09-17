@@ -40,6 +40,13 @@ class ColumnProfile(_Strict):
     # veriden uretilir, kolon adina bakilmaz.
     is_probable_id: bool = False
     id_ardisik: bool = False   # gerekce metnine girer, karara girmez
+    # Gizli sayisal kolon: metin tipinde geldi, sayiya cevrildi. Profil
+    # alanlari (dtype, null_ratio, istatistikler) cevrilmis degerlere aittir.
+    donusturuldu: bool = False
+    ham_dtype: Optional[str] = None           # okunurken gelen dtype
+    donusum_orani: Optional[float] = None     # dolu degerlerin sayi orani
+    n_donusmeyen: int = 0                     # eksik sayilan deger sayisi
+    donusmeyen_ornekler: list[str] = []
 
 class DataProfile(_Strict):
     "Veri setinin tamamı hakkında öğrendiklerimiz"
