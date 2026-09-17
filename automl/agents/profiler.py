@@ -41,6 +41,50 @@ def _detect_type(s: pd.Series, n_rows:int) -> InferredType:
 
     return "categorical"
 
+# Kimlik kolonu tespiti. Esikler ORANSAL: sabit sayi kullanilmaz ki
+# veri boyutundan bagimsiz calissin.
+ID_ORAN_ESIGI = 0.95   # essiz deger / satir sayisi bu oranin ustundeyse
+ID_MIN_SATIR = 20      # bu satirdan az veride ID tespiti hic yapilmaz
+ID_ARDISIK_TOLERANS = 0.05   # (max-min+1) satir sayisindan bu kadar sapabilir
+
+
+def _probable_id(s: pd.Series, n_rows: int,
+                 tip: InferredType) -> tuple[bool, bool]:
+    """Kolon bir kimlik (sira numarasi) kolonu mu?
+
+    Karar SADECE veriden gelir; kolon adina BAKILMAZ, cunku "id" kelimesi
+    aramak domain-bagimsizlik ilkesini bozar.
+
+    Donen: (id_mi, ardisik_mi). Ardisiklik karara GIRMEZ, sadece gerekce
+    metninde tetikleyen deger olarak gosterilir.
+
+    Kucuk veride her sayisal kolon "benzersiz" gorunur: 6 satirlik veride
+    yas ve maas kolonlari da ID sanilirdi. ID_MIN_SATIR bunu engeller.
+    """
+    if tip != "numeric" or n_rows < ID_MIN_SATIR:
+        return False, False
+
+    # Kimlik kolonunda eksik deger olmaz.
+    if bool(s.isna().any()):
+        return False, False
+
+    clean = s.dropna()
+    if len(clean) == 0:
+        return False, False
+
+    # Ondalikli deger varsa olcumdur, sira numarasi degil.
+    if not bool(clean.mod(1).eq(0).all()):
+        return False, False
+
+    if clean.nunique() / max(n_rows, 1) < ID_ORAN_ESIGI:
+        return False, False
+
+    # Ek sinyal: degerler ardisik mi (1..n gibi)? Sadece bilgi amacli.
+    aralik = float(clean.max()) - float(clean.min()) + 1
+    ardisik = abs(aralik - n_rows) / max(n_rows, 1) < ID_ARDISIK_TOLERANS
+    return True, ardisik
+
+
 def _numeric_stats(s: pd.Series) -> dict:
     """Sayisal kolon icin betimsel istatistikler."""
     clean = s.dropna()
@@ -99,6 +143,7 @@ def profile(state: RunState) -> RunState:
     for name in df.columns:
         s = df[name]
         tip = _detect_type(s, n_rows)
+        id_mi, id_ardisik = _probable_id(s, n_rows, tip)
 
         # Tipe gore ek istatistikler
         ekstra = {}
@@ -114,6 +159,8 @@ def profile(state: RunState) -> RunState:
                 inferred_type=tip,
                 n_unique=int(s.nunique(dropna=True)),
                 null_ratio=float(s.isna().mean()),
+                is_probable_id=id_mi,
+                id_ardisik=id_ardisik,
                 **ekstra,
             )
         )
@@ -141,8 +188,10 @@ def profile(state: RunState) -> RunState:
             class_balance = {str(k): float(v) for k, v in oranlar.items()}
 
         # Sayisal kolonlar arasi yuksek korelasyonlar (hedef haric)
+    # Kimlik kolonu korelasyona girmez: sira numarasinin korelasyonu gurultu.
     sayisal = [c.name for c in columns
-               if c.inferred_type == "numeric" and c.name != target]
+               if c.inferred_type == "numeric" and not c.is_probable_id
+               and c.name != target]
     korelasyonlar = _high_correlations(df, sayisal)
 
     state.profile = DataProfile(

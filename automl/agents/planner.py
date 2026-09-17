@@ -1,6 +1,9 @@
 """Profile bakarak preprocessing planini uretir."""
 from automl import llm
 from automl.agents.base import Agent
+# ID orani profiler'da test ediliyor, esik de orada tanimli: gerekce
+# metninde ayni sabit kullanilsin ki basilan esik koddan sapmasin.
+from automl.agents.profiler import ID_ORAN_ESIGI
 from automl.memory.store import benzer_runlar
 from automl.schemas import (ColumnDecision, DataProfile, PreprocessingPlan,
                             RunState)
@@ -119,6 +122,22 @@ def plan(state: RunState) -> RunState:
                 reason="kardinalite çok yüksek, one-hot kodlama boyutu "
                        "patlatır ve model seyrek veriye boğulur",
                 trigger=f"{c.n_unique} eşsiz kategori > {kard_esik_metni}",
+            ))
+            continue
+
+        if c.is_probable_id:
+            drop_cols.append(c.name)
+            notes.append(f"{c.name}: kimlik kolonu, atildi")
+            oran = c.n_unique / max(p.n_rows, 1)
+            tetik = (f"{c.n_unique} eşsiz / {p.n_rows} satır = "
+                     f"%{oran*100:.0f} (eşik %{ID_ORAN_ESIGI*100:.0f})")
+            if c.id_ardisik:
+                tetik += ", değerler ardışık"
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type, decision="drop",
+                reason="satır başına benzersiz değer, kimlik kolonu — "
+                       "bilgi taşımıyor",
+                trigger=tetik,
             ))
             continue
 

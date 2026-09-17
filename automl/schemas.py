@@ -36,6 +36,10 @@ class ColumnProfile(_Strict):
     # kategorik kolonlar icin
     top_value: Optional[str] = None
     top_ratio: Optional[float] = None
+    # Kimlik (sira numarasi) kolonu sinyali: karar profiler'da sadece
+    # veriden uretilir, kolon adina bakilmaz.
+    is_probable_id: bool = False
+    id_ardisik: bool = False   # gerekce metnine girer, karara girmez
 
 class DataProfile(_Strict):
     "Veri setinin tamamı hakkında öğrendiklerimiz"
