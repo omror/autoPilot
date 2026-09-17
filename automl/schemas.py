@@ -50,6 +50,13 @@ class DataProfile(_Strict):
     columns: list[ColumnProfile] = []
     class_balance: Optional[dict[str,float]] = None
     high_correlations: list[tuple[str, str, float]] = []
+    # Sinif dengesizligi (sadece classification'da dolu). Karar profiler'da
+    # DENGESIZLIK_ESIGI ile verilir; metrik secimi buna gore degisir.
+    is_imbalanced: bool = False
+    imbalance_ratio: Optional[float] = None   # cogunluk / azinlik
+    minority_class: Optional[str] = None
+    minority_ratio: Optional[float] = None
+    imbalance_reason: str = ""
 
 
 class ColumnDecision(_Strict):
@@ -100,6 +107,13 @@ class RunResult(BaseModel):
     test_metrics: dict[str, float] = {}
     feature_importance: dict[str, float] = {}
     gini_importance: dict[str, float] = {}
+    # Azinlik sinifi confusion matrix sayimlari (sadece dengesiz veride):
+    # toplam, yakalanan, kacirilan, yanlis_alarm.
+    azinlik_sayimlari: dict[str, int] = {}
+    # Secilen modelin CV skoru Baseline'dan ne kadar iyi? (metric_name ile)
+    baseline_cv: Optional[float] = None
+    baseline_farki: Optional[float] = None
+    baseline_uyarisi: str = ""
 
 @dataclass
 class RunState:

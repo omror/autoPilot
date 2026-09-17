@@ -4,7 +4,8 @@ import time
 from automl.schemas import (ColumnDecision, ColumnProfile, DataProfile,
                             PreprocessingPlan, RunState)
 from automl.agents.loader import LoaderAgent
-from automl.agents.profiler import ProfilerAgent
+from automl.agents.profiler import (DENGESIZLIK_ESIGI, ProfilerAgent,
+                                    ana_metrik, esik_gerekcesi)
 from automl.agents.splitter import SplitterAgent
 from automl.agents.planner import PlannerAgent
 from automl.agents.preprocessor import PreprocessorAgent
@@ -99,6 +100,48 @@ def _grup_yaz(baslik: str, islem: str, kararlar: list[ColumnDecision],
                         subsequent_indent="              "))
 
 
+def _dengesizlik_yaz(p: DataProfile) -> None:
+    """Siniflandirmada dengesizlik kararini basar.
+
+    Dengeli veride tek satir; dengesizse dagilim, oran, azinlik sinifi,
+    gecilen metrik ve NEDEN gecildigi belirgin bir blokta.
+    """
+    if p.task_type != "classification" or p.minority_ratio is None:
+        return
+    if not p.is_imbalanced:
+        print(textwrap.fill(f"Dengesizlik: yok. {p.imbalance_reason}",
+                            width=76, subsequent_indent="  "))
+        return
+
+    def satir(etiket: str, metin: str) -> None:
+        _etiketli_yaz(f"{etiket:10}", metin)
+
+    cizgi = "!" * 76
+    print(f"\n{cizgi}")
+    print("!!! SINIF DENGESIZLIGI TESPIT EDILDI")
+    print(cizgi)
+    # Oranlar hedefin dolu satirlari uzerinden: sayimi da oradan geri kur.
+    hedef = next((c for c in p.columns if c.name == p.target), None)
+    dolu = p.n_rows * (1 - (hedef.null_ratio if hedef else 0.0))
+    print("  Sınıf dağılımı:")
+    for sinif, oran in sorted((p.class_balance or {}).items(),
+                              key=lambda x: -x[1]):
+        isaret = "  <- azınlık" if sinif == p.minority_class else ""
+        print(f"    {sinif[:20]:20} %{oran * 100:6.2f}  "
+              f"({round(oran * dolu)} satır){isaret}")
+    satir("oran", f"{p.imbalance_ratio:.1f} : 1 (çoğunluk / azınlık)")
+    satir("azınlık", f"'{p.minority_class}' %{p.minority_ratio * 100:.2f} "
+                     f"< DENGESIZLIK_ESIGI %{DENGESIZLIK_ESIGI * 100:g}")
+    satir("metrik", f"f1_weighted -> {ana_metrik(p)} (CV, test ve "
+                    f"iterasyon eşiği)")
+    satir("neden", p.imbalance_reason)
+    satir("eşik", esik_gerekcesi())
+    satir("modeller", "havuza class_weight='balanced' varyantları eklendi "
+                      "(LogisticRegression, RandomForest); mevcutlar da "
+                      "kaldı, CV karşılaştırır")
+    print(cizgi)
+
+
 def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
                                  p: DataProfile) -> None:
     "Her kolon icin verilen karari, gerekcesini ve tetikleyen degeri basar."
@@ -183,6 +226,13 @@ def run(data_path: str, target: str | None = None,
         print(f"-> {agent.name} calisiyor...")
         state = agent(state)
 
+    profil = state.profile
+    if profil is None:
+        raise RuntimeError("profile adimi calismadi: state.profile bos")
+    # Esik her zaman ana metrik uzerinden: dengesiz veride f1_macro.
+    metrik = ana_metrik(profil)
+    metrik_notu = f" [{metrik}, dengesiz veri]" if profil.is_imbalanced else ""
+
     # 2) Self-improvement dongusu: esigi gecene kadar strateji degistir.
     en_iyi: dict | None = None
     for i in range(1, max_iterasyon + 1):
@@ -228,15 +278,15 @@ def run(data_path: str, target: str | None = None,
             en_iyi = _goruntu_al(state)
             print("   -> simdiye kadarki en iyi sonuc")
 
-        if _yeterli_mi(r.metric_name, r.metric_value, r.task_type):
+        if _yeterli_mi(metrik, r.test_metrics[metrik], r.task_type):
             esik = ESIKLER.get(r.task_type)
-            print(f"   esik ({esik}) gecildi, dongu durduruluyor")
+            print(f"   esik ({esik}){metrik_notu} gecildi, dongu durduruluyor")
             break
 
         if i < max_iterasyon:
             esik = ESIKLER.get(r.task_type)
-            print(f"   skor esigin ({esik}) altinda, farkli strateji "
-                  f"denenecek")
+            print(f"   skor esigin ({esik}){metrik_notu} altinda, farkli "
+                  f"strateji denenecek")
         else:
             print(f"   max iterasyona ({max_iterasyon}) ulasildi, duruluyor")
 
@@ -260,6 +310,7 @@ def run(data_path: str, target: str | None = None,
     print(f"Satır: {p.n_rows} Kolon: {p.n_cols}")
     print(f"Hedef: {p.target} Task: {p.task_type}")
     print(f"Sınıf dengesi: {p.class_balance}")
+    _dengesizlik_yaz(p)
     print("\n Kolonlar:")
     for c in p.columns:
         print(f" {c.name:15}, {c.dtype:10} -> {c.inferred_type:12}"
@@ -335,13 +386,41 @@ def run(data_path: str, target: str | None = None,
         print("  (* = raporlanan en iyi iterasyon)")
 
     print("\n--- MODEL KARSILASTIRMA ---")
+    genislik = max([20] + [len(c.name) for c in r.candidates])
     for c in r.candidates:
         isaret = "*" if c.name == r.model_name else " "
-        print(f" {isaret} {c.name:20} cv={c.cv_mean:.3f} (+/-{c.cv_std:.3f})")
+        print(f" {isaret} {c.name:{genislik}} cv={c.cv_mean:.3f} "
+              f"(+/-{c.cv_std:.3f})")
+    if r.baseline_farki is not None and r.baseline_cv is not None:
+        print(f"  Baseline farkı ({r.metric_name}, cv): {r.model_name} "
+              f"{r.baseline_cv + r.baseline_farki:.4f} - Baseline "
+              f"{r.baseline_cv:.4f} = {r.baseline_farki:+.4f}")
+    else:
+        print("  Baseline farkı: hesaplanamadı (Baseline aday listesinde yok)")
+    if r.baseline_uyarisi:
+        print("  " + "!" * 74)
+        print(textwrap.fill(r.baseline_uyarisi, width=76,
+                            initial_indent="  ! ", subsequent_indent="  ! "))
+        print("  " + "!" * 74)
 
     print(f"\n--- TEST SONUCU ({r.model_name}) ---")
+    genislik = max([12] + [len(k) for k in r.test_metrics])
     for k, v in r.test_metrics.items():
-        print(f"  {k:12} : {v:.4f}")
+        ana = "  <- ana metrik" if p.is_imbalanced and k == r.metric_name else ""
+        print(f"  {k:{genislik}} : {v:.4f}{ana}")
+    if r.azinlik_sayimlari:
+        s = r.azinlik_sayimlari
+        print(textwrap.fill(
+            f"azınlık sınıfı '{p.minority_class}' (test setinde "
+            f"{s['toplam']} örnek): {s['yakalanan']} yakalandı, "
+            f"{s['kacirilan']} kaçırıldı, {s['yanlis_alarm']} yanlış alarm",
+            width=76, initial_indent="  ", subsequent_indent="    "))
+    if p.is_imbalanced and "pr_auc" in r.test_metrics:
+        print(textwrap.fill(
+            f"not: pr_auc'ta rastgele tahmin seviyesi azınlık oranıdır "
+            f"(≈{p.minority_ratio:.4f}). gini ROC tabanlıdır, dengesiz "
+            f"veride çok sayıdaki doğru negatif yüzünden iyimser görünür.",
+            width=76, initial_indent="  ", subsequent_indent="  "))
 
     if r.feature_importance:
         print("\n--- FEATURE IMPORTANCE ---")

@@ -134,6 +134,92 @@ def _high_correlations(df: pd.DataFrame, cols: list[str],
     ciftler.sort(key=lambda x: abs(x[2]), reverse=True)
     return ciftler[:15]
 
+
+# Sinif dengesizligi: en kucuk sinifin orani bu esigin ALTINDAYSA veri
+# dengesiz sayilir. Gerekce: f1_weighted her sinifi buyuklugu kadar
+# agirliklandirir. Hep cogunluk sinifini soyleyen model ikili veride
+# azinlik orani p iken f1_weighted = (1-p) * 2(1-p)/(2-p) alir:
+# p=0.15'te 0.78, p=0.137'de 0.80 (classification iterasyon esigi),
+# p=0.10'da 0.85. Yani yaygin %10 esigi, hicbir sey ogrenmeyen modelin
+# esigi gectigi %10-%13.7 araligini kacirirdi; %15 bu boslugu kapatir.
+DENGESIZLIK_ESIGI = 0.15
+
+
+def _cogunluk_modeli_skorlari(oranlar: dict[str, float]) -> tuple[float, float]:
+    """Hep cogunluk sinifini soyleyen modelin (f1_weighted, f1_macro) skoru.
+
+    Bu model sadece cogunluk sinifinda isabet eder: o sinifta
+    precision = p_max, recall = 1; diger siniflarin F1'i 0. Model
+    egitmeden, sadece sinif dagilimindan hesaplanir.
+    """
+    p_max = max(oranlar.values())
+    f1_cogunluk = 2 * p_max / (1 + p_max)
+    return p_max * f1_cogunluk, f1_cogunluk / len(oranlar)
+
+
+def esik_gerekcesi() -> str:
+    "DENGESIZLIK_ESIGI neden bu deger? Metin sabitin kendisinden uretilir."
+    p = DENGESIZLIK_ESIGI
+    w, m = _cogunluk_modeli_skorlari({"cogunluk": 1 - p, "azinlik": p})
+    return (
+        f"f1_weighted her sınıfı büyüklüğü kadar ağırlıklandırır. İkili "
+        f"veride azınlık oranı tam DENGESIZLIK_ESIGI (%{p * 100:g}) iken "
+        f"bile hep çoğunluk sınıfını söyleyen model f1_weighted={w:.2f} "
+        f"alır (f1_macro={m:.2f}). Azınlık küçüldükçe bu skor 1'e yaklaşır; "
+        f"eşiğin altında f1_weighted azınlık sınıfını fiilen göremez."
+    )
+
+
+def _dengesizlik(oranlar: dict[str, float]) -> dict:
+    """Sinif dagilimindan dengesizlik alanlarini uretir.
+
+    Cok sinifli veride de ayni kural gecerli: en kucuk sinifin oranina
+    bakilir.
+    """
+    if not oranlar:
+        return {}
+    azinlik = min(oranlar, key=lambda k: oranlar[k])
+    cogunluk = max(oranlar, key=lambda k: oranlar[k])
+    p_min, p_max = oranlar[azinlik], oranlar[cogunluk]
+    dengesiz = p_min < DENGESIZLIK_ESIGI
+    esik = f"(DENGESIZLIK_ESIGI = %{DENGESIZLIK_ESIGI * 100:g})"
+
+    if dengesiz:
+        w, m = _cogunluk_modeli_skorlari(oranlar)
+        gerekce = (
+            f"En küçük sınıf '{azinlik}': oran %{p_min * 100:.2f}, eşiğin "
+            f"altında {esik}. Hiçbir şey öğrenmeyip hep '{cogunluk}' diyen "
+            f"model bu dağılımda f1_weighted={w:.4f} alır; azınlık sınıfının "
+            f"tamamını kaçırmasına rağmen. f1_macro sınıflara eşit ağırlık "
+            f"verir: aynı model f1_macro={m:.4f} alır, azınlık sınıfındaki "
+            f"başarısızlık skora yansır. Bu yüzden CV, test ve iterasyon "
+            f"eşiği f1_weighted yerine f1_macro ile değerlendirilir."
+        )
+    else:
+        gerekce = (
+            f"En küçük sınıf '{azinlik}': oran %{p_min * 100:.1f}, eşiğin "
+            f"altında değil {esik}. Dengeli sayıldı, f1_weighted korunuyor."
+        )
+
+    return {
+        "is_imbalanced": dengesiz,
+        "imbalance_ratio": p_max / p_min,
+        "minority_class": azinlik,
+        "minority_ratio": p_min,
+        "imbalance_reason": gerekce,
+    }
+
+
+def ana_metrik(p: DataProfile) -> str:
+    """CV skoru, test ana metrigi ve iterasyon esigi icin TEK metrik karari.
+
+    Adlar sklearn scoring adlariyla aynidir; modeler dogrudan
+    cross_val_score'a verir, evaluator test_metrics anahtari olarak kullanir.
+    """
+    if p.task_type == "regression":
+        return "r2"
+    return "f1_macro" if p.is_imbalanced else "f1_weighted"
+
 def profile(state: RunState) -> RunState:
 
     df = state.df
@@ -170,6 +256,7 @@ def profile(state: RunState) -> RunState:
         target = df.columns[-1]
 
     class_balance = None
+    dengesizlik = {}
     task_type: TaskType
     if target is None:
         task_type = "clustering"
@@ -186,6 +273,7 @@ def profile(state: RunState) -> RunState:
             task_type = "classification"
             oranlar = df[target].value_counts(normalize=True)
             class_balance = {str(k): float(v) for k, v in oranlar.items()}
+            dengesizlik = _dengesizlik(class_balance)
 
         # Sayisal kolonlar arasi yuksek korelasyonlar (hedef haric)
     # Kimlik kolonu korelasyona girmez: sira numarasinin korelasyonu gurultu.
@@ -202,6 +290,7 @@ def profile(state: RunState) -> RunState:
         columns = columns,
         class_balance=class_balance,
         high_correlations=korelasyonlar,
+        **dengesizlik,
     )
 
     return state

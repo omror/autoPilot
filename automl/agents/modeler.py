@@ -12,6 +12,7 @@ from sklearn.model_selection import cross_val_score
 
 from automl import llm
 from automl.agents.base import Agent
+from automl.agents.profiler import ana_metrik
 from automl.schemas import ModelScore, ModelSecimi, RunState
 
 SYSTEM_PROMPT = (
@@ -20,8 +21,19 @@ SYSTEM_PROMPT = (
 )
 
 
-def _candidate_models(task_type: str, n_rows:int) -> dict:
-    "Task tipine göre aday model havuzunu otomatik seçer."
+# Baseline her denemede CV'ye girer: secilen modelin ondan ne kadar iyi
+# oldugu evaluator'da raporlanir, LLM havuzu daraltsa bile.
+BASELINE = "Baseline"
+
+
+def _candidate_models(task_type: str, n_rows:int,
+                      dengesiz: bool = False) -> dict:
+    """Task tipine göre aday model havuzunu otomatik seçer.
+
+    Dengesiz classification verisinde class_weight='balanced' varyantlari
+    havuza EKLENIR; mevcut modeller de kalir ki CV ikisini karsilastirsin.
+    Dengeli veride havuz aynen korunur.
+    """
     if task_type == "regression":
         return {
             "Baseline": DummyRegressor(strategy="mean"),
@@ -32,7 +44,7 @@ def _candidate_models(task_type: str, n_rows:int) -> dict:
             "GradientBoosting": GradientBoostingRegressor(random_state=42),
 
         }
-    return {
+    models = {
         "Baseline": DummyClassifier(strategy="most_frequent"),
         "LogisticRegression": LogisticRegression(max_iter=1000),
         "RandomForest": RandomForestClassifier(
@@ -40,6 +52,15 @@ def _candidate_models(task_type: str, n_rows:int) -> dict:
         ),
         "GradientBoosting": GradientBoostingClassifier(random_state=42),
         }
+    if dengesiz:
+        # Azinlik sinifindaki hatayi sinif frekansinin tersiyle agirliklandirir.
+        models["LogisticRegression_balanced"] = LogisticRegression(
+            max_iter=1000, class_weight="balanced"
+        )
+        models["RandomForest_balanced"] = RandomForestClassifier(
+            n_estimators=100, random_state=42, class_weight="balanced"
+        )
+    return models
 
 def train(state: RunState,
           izinli_modeller: list[str] | None = None) -> RunState:
@@ -49,10 +70,12 @@ def train(state: RunState,
         raise RuntimeError("profile üretilmemiş, önce profiler çalışmalı")
     X, y = state.X_train_t, state.y_train
 
-    models = _candidate_models(p.task_type, p.n_rows)
+    models = _candidate_models(p.task_type, p.n_rows, p.is_imbalanced)
     if izinli_modeller:
-        models = {k: v for k, v in models.items() if k in izinli_modeller}
-    scoring = "r2" if p.task_type == "regression" else "f1_weighted"
+        models = {k: v for k, v in models.items()
+                  if k in izinli_modeller or k == BASELINE}
+    # Dengesiz veride f1_macro: azinlik sinifi skora esit agirlikla girer.
+    scoring = ana_metrik(p)
 
     #Küçük veride fold sayısını otomatik düşürür
     n_splits = max(2, min(5, len(y) // 2))
@@ -103,6 +126,11 @@ def _model_ozeti(state: RunState, havuz: list[str]) -> str:
     ]
     if p.class_balance:
         satirlar.append(f"Sinif dagilimi: {p.class_balance}")
+    if p.is_imbalanced:
+        satirlar.append(
+            f"Dengesiz veri: azinlik sinifi {p.minority_class!r} "
+            f"(oran {p.minority_ratio:.4f}), CV metrigi {ana_metrik(p)}"
+        )
     if p.high_correlations:
         satirlar.append(
             f"Yuksek korelasyonlu cift sayisi: {len(p.high_correlations)}"
@@ -151,7 +179,8 @@ class ModelerAgent(Agent):
         if p is None:
             raise RuntimeError("profile üretilmemiş, önce profiler çalışmalı")
 
-        havuz = list(_candidate_models(p.task_type, p.n_rows).keys())
+        havuz = list(_candidate_models(p.task_type, p.n_rows,
+                                       p.is_imbalanced).keys())
 
         # LLM varsa havuzu daraltmasini iste, yoksa tum havuz denenir.
         secim = None
