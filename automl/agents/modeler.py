@@ -8,7 +8,7 @@ from sklearn.ensemble import (
     RandomForestRegressor,
 )
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 from automl import llm
 from automl.agents.base import Agent
@@ -62,6 +62,24 @@ def _candidate_models(task_type: str, n_rows:int,
         )
     return models
 
+def _cv_bolucu(task_type: str, y) -> StratifiedKFold | int:
+    """Cross-validation fold bolucusu.
+
+    Classification: StratifiedKFold, her fold verideki sinif oranlarini
+    korur; dengesiz veride azinlik sinifi her fold'a dagilir. shuffle +
+    random_state ile bolme tekrarlanabilir.
+    Regression: fold sayisi (int) doner, sklearn tabakasiz KFold kurar.
+    """
+    #Küçük veride fold sayısını otomatik düşürür
+    n_splits = max(2, min(5, len(y) // 2))
+    if task_type != "classification":
+        return n_splits
+    # Fold sayisi en az ornekli sinifi gecmesin: her fold o siniftan ornek
+    # alabilsin. Tek ornekli sinifta 2 fold'a iner (sklearn uyari verir).
+    n_splits = max(2, min(n_splits, int(y.value_counts().min())))
+    return StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+
 def train(state: RunState,
           izinli_modeller: list[str] | None = None) -> RunState:
     "Aday modelleri CV ile karşılaştırır, en iyisini seçip eğitir."
@@ -77,15 +95,12 @@ def train(state: RunState,
     # Dengesiz veride f1_macro: azinlik sinifi skora esit agirlikla girer.
     scoring = ana_metrik(p)
 
-    #Küçük veride fold sayısını otomatik düşürür
-    n_splits = max(2, min(5, len(y) // 2))
-    if p.task_type == "classification":
-        n_splits = max(2, min(n_splits, int(y.value_counts().min())))
+    cv_bolucu = _cv_bolucu(p.task_type, y)
 
     scores = []
     for name, model in models.items():
         try:
-            cv = cross_val_score(model, X, y, cv=n_splits, scoring=scoring)
+            cv = cross_val_score(model, X, y, cv=cv_bolucu, scoring=scoring)
             scores.append(
                 ModelScore(
                     name = name,

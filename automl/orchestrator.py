@@ -441,6 +441,9 @@ def run(data_path: str, target: str | None = None,
             f"{s['toplam']} örnek): {s['yakalanan']} yakalandı, "
             f"{s['kacirilan']} kaçırıldı, {s['yanlis_alarm']} yanlış alarm",
             width=76, initial_indent="  ", subsequent_indent="    "))
+        if s["toplam"] == 0:
+            print("  not: test setinde azınlık örneği yok; azınlık "
+                  "precision/recall/pr_auc hesaplanamadı")
     if p.is_imbalanced and "pr_auc" in r.test_metrics:
         print(textwrap.fill(
             f"not: pr_auc'ta rastgele tahmin seviyesi azınlık oranıdır "

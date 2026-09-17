@@ -95,6 +95,27 @@ def _dengesiz_metrikler(model, X_te, y_te, y_pred,
     if etiket is None:
         return metrikler, {}
 
+    # Confusion matrix'in azinlik satiri/sutunu: kac tanesi yakalandi?
+    # Cok az ornekli azinlik test setine hic dusmemis olabilir; etiket yine
+    # de listede olsun ki satiri (sifir) okunabilsin.
+    siniflar = list(np.unique(np.concatenate([np.asarray(y_te),
+                                              np.asarray(y_pred)])))
+    if etiket not in siniflar:
+        siniflar.append(etiket)
+    cm = confusion_matrix(y_te, y_pred, labels=siniflar)
+    i = siniflar.index(etiket)
+    yakalanan = int(cm[i, i])
+    sayimlar = {
+        "toplam": int(cm[i, :].sum()),
+        "yakalanan": yakalanan,
+        "kacirilan": int(cm[i, :].sum()) - yakalanan,
+        "yanlis_alarm": int(cm[:, i].sum()) - yakalanan,
+    }
+    # Test setinde azinlik yoksa recall ve PR-AUC tanimsiz: 0 diye
+    # raporlamak yaniltirdi, hic hesaplanmaz.
+    if sayimlar["toplam"] == 0:
+        return metrikler, sayimlar
+
     precision, recall, f1, _ = precision_recall_fscore_support(
         y_te, y_pred, labels=[etiket], zero_division=0  # type: ignore
     )
@@ -114,18 +135,6 @@ def _dengesiz_metrikler(model, X_te, y_te, y_pred,
     except Exception as e:
         print(f"   ! pr_auc hesaplanamadi: {type(e).__name__}: {e}")
 
-    # Confusion matrix'in azinlik satiri/sutunu: kac tanesi yakalandi?
-    siniflar = list(np.unique(np.concatenate([np.asarray(y_te),
-                                              np.asarray(y_pred)])))
-    cm = confusion_matrix(y_te, y_pred, labels=siniflar)
-    i = siniflar.index(etiket)
-    yakalanan = int(cm[i, i])
-    sayimlar = {
-        "toplam": int(cm[i, :].sum()),
-        "yakalanan": yakalanan,
-        "kacirilan": int(cm[i, :].sum()) - yakalanan,
-        "yanlis_alarm": int(cm[:, i].sum()) - yakalanan,
-    }
     return metrikler, sayimlar
 
 
