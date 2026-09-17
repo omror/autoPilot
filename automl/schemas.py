@@ -10,7 +10,10 @@ InferredType = Literal["numeric", "categorical", "text", "datetime"]
 TaskType = Literal["classification", "regression", "clustering"]
 # Bir kolon hakkinda verilebilecek kararlar: atildi, hangi pipeline'a gitti
 # ya da hedef kolon oldugu icin ozellik listelerine hic girmedi.
-KararTipi = Literal["drop", "numeric", "categorical", "target"]
+# Yuksek kardinaliteli kategorikler icin: nadir kategoriler toplanip one-hot
+# (nadir_toplama) ya da frequency encoding (frekans).
+KararTipi = Literal["drop", "numeric", "categorical", "nadir_toplama",
+                    "frekans", "target"]
 
 
 class _Strict(BaseModel):
@@ -84,6 +87,10 @@ class ColumnDecision(_Strict):
 class PreprocessingPlan(BaseModel):
     numeric_cols: list[str] = []
     categorical_cols: list[str] = []
+    # Yuksek kardinaliteli kategorikler: atilmak yerine bu stratejilerle
+    # kullanilir. Listeler birbirinden ve categorical_cols'tan ayridir.
+    nadir_toplama_cols: list[str] = []
+    frekans_cols: list[str] = []
     drop_cols: list[str] = []
     numeric_imputation: str = "median"
     categorical_imputation: str = "most_frequent"

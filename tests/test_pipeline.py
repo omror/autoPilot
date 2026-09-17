@@ -40,9 +40,21 @@ def test_bos_kolon_atildi(messy_state):
     assert "bos_kolon" not in pl.categorical_cols
 
 
-def test_yuksek_kardinaliteli_kategorik_atildi(messy_state):
-    "~60 essiz degerli kategorik kolon one-hot patlamasini onlemek icin atilir."
-    assert "urun_kodu" in messy_state.plan.drop_cols
+def test_yuksek_kardinaliteli_gurultu_kolonu_cv_ile_atilir(messy_state):
+    """urun_kodu ~60 kategorili ve hedefle iliskisiz (make_data'da rastgele).
+
+    Nadir toplama stratejisi secilir ama train icindeki CV'de katkisi fold
+    oynakliginin altinda kalir: kolon atilir.
+    """
+    pl = messy_state.plan
+    assert "urun_kodu" in pl.drop_cols
+    assert pl.nadir_toplama_cols == [] and pl.frekans_cols == []
+
+    karar = next(k for k in pl.column_decisions if k.name == "urun_kodu")
+    assert karar.decision == "drop"
+    assert "60 kategori > eşik 50" in karar.reason
+    assert "CV ile ölçüldü" in karar.reason
+    assert "sinyal taşımıyor" in karar.trigger
 
 
 def test_metin_kolonu_atildi(messy_state):
@@ -99,7 +111,8 @@ def test_drop_gerekceleri_tetiklenen_kurali_gosteriyor(messy_state):
     Dikkat: kayit_tarihi datetime olarak parse EDILMIYOR (loader tarih
     cevirmiyor, kolon str kaliyor). 400 essiz string oldugu icin TEXT
     kuraliyla atiliyor. Yani messy.csv'de 3 ayri drop kurali tetiklenir:
-    null orani, serbest metin (2 kolon) ve kardinalite.
+    null orani, serbest metin (2 kolon) ve yuksek kardinaliteli kolonun
+    CV'de katki saglamamasi.
     """
     atilanlar = {k.name: k for k in messy_state.plan.column_decisions
                  if k.decision == "drop"}
@@ -109,8 +122,6 @@ def test_drop_gerekceleri_tetiklenen_kurali_gosteriyor(messy_state):
     # Tetikleyen deger gercekten esikle birlikte yaziliyor mu?
     assert "%100" in atilanlar["bos_kolon"].trigger
     assert "%50" in atilanlar["bos_kolon"].trigger
-    assert "60 eşsiz kategori" in atilanlar["urun_kodu"].trigger
-    assert "50" in atilanlar["urun_kodu"].trigger
 
     # Metin kuraliyla atilanlar tipini de gerekcesini de metin olarak verir.
     for ad in ("kayit_tarihi", "aciklama"):

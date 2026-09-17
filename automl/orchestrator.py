@@ -90,14 +90,19 @@ def _cevrildi_mi(karar: ColumnDecision,
 
 
 def _grup_yaz(baslik: str, islem: str, kararlar: list[ColumnDecision],
-              profil: dict[str, ColumnProfile]) -> None:
-    "Ayni karari alan kolonlari tek blok halinde basar."
+              profil: dict[str, ColumnProfile],
+              sebep_yaz: bool = True) -> None:
+    """Ayni karari alan kolonlari tek blok halinde basar.
+
+    sebep_yaz=False: kolonlarin gerekcesi kendi bolumunde tek tek basildi.
+    """
     print(f"  {baslik} ({len(kararlar)} kolon)")
     # Ayni gruptaki kolonlarin gerekcesi normalde aynidir; farkli gerekce
     # varsa (LLM karari) hepsi ayri satirda gorunsun. Sayiya cevrilen
     # kolonlarin gerekcesi kendi bolumunde tek tek basildi.
-    for sebep in dict.fromkeys(k.reason for k in kararlar
-                               if not _cevrildi_mi(k, profil)):
+    sebepler = [k.reason for k in kararlar
+                if sebep_yaz and not _cevrildi_mi(k, profil)]
+    for sebep in dict.fromkeys(sebepler):
         _etiketli_yaz("sebep", sebep)
     _etiketli_yaz("işlem", islem)
 
@@ -169,6 +174,8 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
         atilanlar = [k for k in kararlar if k.decision == "drop"]
         sayisallar = [k for k in kararlar if k.decision == "numeric"]
         kategorikler = [k for k in kararlar if k.decision == "categorical"]
+        nadirlar = [k for k in kararlar if k.decision == "nadir_toplama"]
+        frekanslar = [k for k in kararlar if k.decision == "frekans"]
         hedefler = [k for k in kararlar if k.decision == "target"]
 
         # Atilanlar tek tek: her birinin sebebi farkli olabilir.
@@ -193,9 +200,23 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
                 _etiketli_yaz("sebep", k.reason)
                 _etiketli_yaz("tetik", k.trigger)
 
+        # Yuksek kardinaliteli kategorikler tek tek: hangi strateji, neden.
+        stratejiler = nadirlar + frekanslar
+        if stratejiler:
+            print(f"\nYÜKSEK KARDİNALİTELİ KOLONLAR "
+                  f"({len(stratejiler)} kolon)")
+            etiketler = {"nadir_toplama": "NADIR TOPLAMA + ONEHOT",
+                         "frekans": "FREQUENCY ENCODING"}
+            for k in stratejiler:
+                print(f"  {k.name[:20]:20} [{k.inferred_type}]  "
+                      f"{etiketler[k.decision]}")
+                _etiketli_yaz("sebep", k.reason)
+                _etiketli_yaz("tetik", k.trigger)
+
         # Tutulanlar gruplu: 30 kolonlu veride ekrani bogmasin.
         print(f"\nTUTULAN KOLONLAR "
-              f"({len(sayisallar) + len(kategorikler)} kolon)")
+              f"({len(sayisallar) + len(kategorikler) + len(stratejiler)} "
+              f"kolon)")
         if sayisallar:
             _grup_yaz("sayısal pipeline",
                       f"{pl.numeric_imputation} imputation + "
@@ -206,6 +227,16 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
                       f"{pl.categorical_imputation} imputation + "
                       f"{pl.encoding} encoding",
                       kategorikler, profil)
+        if nadirlar:
+            _grup_yaz("nadir toplama + one-hot pipeline",
+                      f"{pl.categorical_imputation} imputation + nadir "
+                      f"kategorileri toplama (train'den) + onehot encoding",
+                      nadirlar, profil, sebep_yaz=False)
+        if frekanslar:
+            _grup_yaz("frequency encoding pipeline",
+                      f"{pl.categorical_imputation} imputation + frekans "
+                      f"(train'den) + standard scaling",
+                      frekanslar, profil, sebep_yaz=False)
 
         if hedefler:
             print("\nHEDEF KOLON")
@@ -218,8 +249,10 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
     atlanacak = set()
     if not pl.numeric_cols:
         atlanacak |= {"numeric_imputation", "scaling"}
-    if not pl.categorical_cols:
-        atlanacak |= {"categorical_imputation", "encoding"}
+    if not (pl.categorical_cols or pl.nadir_toplama_cols):
+        atlanacak.add("encoding")
+    if not (pl.categorical_cols or pl.nadir_toplama_cols or pl.frekans_cols):
+        atlanacak.add("categorical_imputation")
     gerekceler = {ad: g for ad, g in pl.step_reasons.items()
                   if ad not in atlanacak}
 
@@ -232,9 +265,13 @@ def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
                 subsequent_indent=" " * 27))
 
     print("\nÖZET")
-    print(f"  kolonlar: {len(pl.numeric_cols) + len(pl.categorical_cols)} "
+    n_strateji = len(pl.nadir_toplama_cols) + len(pl.frekans_cols)
+    strateji_notu = (f" + {n_strateji} yüksek kardinalite" if n_strateji
+                     else "")
+    n_tutulan = len(pl.numeric_cols) + len(pl.categorical_cols) + n_strateji
+    print(f"  kolonlar: {n_tutulan} "
           f"tutuldu ({len(pl.numeric_cols)} sayısal + "
-          f"{len(pl.categorical_cols)} kategorik), "
+          f"{len(pl.categorical_cols)} kategorik{strateji_notu}), "
           f"{len(pl.drop_cols)} atıldı")
     print(textwrap.fill(pl.pca_reason or "-", width=76,
                         initial_indent="  PCA     : ",
@@ -380,6 +417,10 @@ def run(data_path: str, target: str | None = None,
     print("\n--- PLAN ---")
     print(f"Sayisal   : {pl.numeric_cols}")
     print(f"Kategorik : {pl.categorical_cols}")
+    if pl.nadir_toplama_cols:
+        print(f"Nadir top.: {pl.nadir_toplama_cols}")
+    if pl.frekans_cols:
+        print(f"Frekans   : {pl.frekans_cols}")
     print(f"Atilan    : {pl.drop_cols}")
     print(f"Imputation: {pl.numeric_imputation} / {pl.categorical_imputation}")
     print(f"Scaling   : {pl.scaling}   Encoding: {pl.encoding}")

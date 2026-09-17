@@ -1,12 +1,24 @@
 """Profile bakarak preprocessing planini uretir."""
+import math
+import time
+from dataclasses import dataclass
+
+import numpy as np
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import Pipeline
+
 from automl import llm
 from automl.agents.base import Agent
+from automl.agents.modeler import _candidate_models, _cv_bolucu
+# Nadir kategori esigi encoder'in parametresi, preprocessor'da tanimli.
+from automl.agents.preprocessor import NADIR_KATEGORI_ESIGI, pipeline_kur
 # ID orani profiler'da test ediliyor, esik de orada tanimli: gerekce
 # metninde ayni sabit kullanilsin ki basilan esik koddan sapmasin.
-from automl.agents.profiler import GIZLI_SAYISAL_ESIGI, ID_ORAN_ESIGI
+from automl.agents.profiler import (GIZLI_SAYISAL_ESIGI, ID_ORAN_ESIGI,
+                                    ana_metrik)
 from automl.memory.store import benzer_runlar
 from automl.schemas import (ColumnDecision, ColumnProfile, DataProfile,
-                            PreprocessingPlan, RunState)
+                            KararTipi, PreprocessingPlan, RunState)
 
 SYSTEM_PROMPT = (
     "Sen bir ML preprocessing uzmanisin. Verilen veri profiline bakarak "
@@ -16,7 +28,27 @@ SYSTEM_PROMPT = (
 # Karar esikleri: hem karsilastirmada hem gerekce metninde ayni sabit
 # kullanilir, boylece basilan esik koddan sapamaz.
 NULL_ESIGI = 0.5          # bu oranin ustunde null olan kolon atilir
-KARDINALITE_ESIGI = 50    # bundan fazla essiz kategorili kolon atilir
+KARDINALITE_ESIGI = 50    # bundan fazla kategori: one-hot patlar, strateji
+# Train satirlarinin bu oranindan fazlasi train'de yalnizca BIR kez gorulen
+# degerlere sahipse kolon atilir. Gerekce: toplama bu satirlarin hepsini tek
+# nadir kategorisine, frequency encoding hepsini ayni degere (1/n) indirir;
+# iki strateji de neredeyse sabit bir kolon uretir ve test'teki degerler
+# buyuk ihtimalle train'de hic gorulmemistir. %90, "neredeyse her satir
+# farkli" durumunu yakalar; daha dusuk bir esik, tekrar eden kategorilerin
+# tasidigi bilgiyi de cope atardi.
+TEKIL_SATIR_ESIGI = 0.90
+# Yuksek kardinaliteli kolonun katkisi train icinde CV ile olculur. Kolon,
+# ancak kolonlu CV ortalamasi kolonsuzu
+#     KATKI_KATSAYISI * sqrt((std_kolonlu^2 + std_kolonsuz^2) / 2)
+# kadar gecerse tutulur. Referans, iki surumun fold'lar arasi tipik
+# oynakligidir (havuzlanmis std). Ortalamanin standart hatasi
+# (std / sqrt(k)) kullanilmadi: fold'lar ayni satirlari paylastigi icin
+# skorlari bagimsiz degil, std / sqrt(k) belirsizligi oldugundan kucuk
+# gosterir. 1.0 katsayi 5 fold'da yaklasik 2.2 standart hataya denk gelir:
+# yaygin "2 standart hata" kuralina yakin, fold bagimliligi yuzunden de
+# temkinli. Telco'da oynaklik +-0.011 iken 0.0001'lik fark bu esigin cok
+# altinda kalirdi; gurultu kolon tutma karari veremez.
+KATKI_KATSAYISI = 1.0
 PCA_KOLON_ESIGI = 10      # bundan fazla sayisal kolon varsa PCA aday
 PCA_SATIR_ESIGI = 50      # PCA icin gereken en az satir sayisi
 
@@ -70,6 +102,175 @@ def _donusum_gerekcesi(c: ColumnProfile) -> tuple[str, str]:
     return sebep, tetik
 
 
+def _yuksek_kardinalite_karari(c: ColumnProfile,
+                               X_train) -> tuple[KararTipi, str, str]:
+    """KARDINALITE_ESIGI'ni asan kategorik kolon icin strateji secer.
+
+    Sira: neredeyse her satir farkli -> at; nadir toplama sonrasi esigin
+    altina iniyor -> topla + one-hot; inmiyor -> frequency encoding.
+    Sayimlar TRAIN setinden yapilir: encoder'lar da sadece train'de fit
+    edilir, boylece basilan sayilar pipeline'in ogrendigiyle ayni olur.
+    Eksik degerler sayilmaz; imputation onlari en sik kategoriye atar.
+    """
+    if X_train is None or c.name not in X_train:
+        raise RuntimeError("plan: yuksek kardinalite karari train setinden "
+                           "verilir, once split calismali")
+    seri = X_train[c.name]
+    n = len(seri)
+    sayim = seri.value_counts()
+    n_kat = len(sayim)
+    nadir = int((sayim < NADIR_KATEGORI_ESIGI * n).sum())
+    kalan = n_kat - nadir + (1 if nadir else 0)
+    tekil_oran = float(sayim[sayim == 1].sum()) / max(n, 1)
+
+    nadir_esik = f"%{NADIR_KATEGORI_ESIGI * 100:g} (NADIR_KATEGORI_ESIGI)"
+    kard = (f"tüm veride {c.n_unique} kategori > eşik {KARDINALITE_ESIGI} "
+            f"(KARDINALITE_ESIGI)")
+
+    if tekil_oran > TEKIL_SATIR_ESIGI:
+        return (
+            "drop",
+            "neredeyse her satır farklı: toplama bu satırları tek nadir "
+            "kategoride, frequency encoding aynı değerde birleştirir; kolon "
+            "bilgi taşımaz",
+            f"train'de {n_kat} kategori / {n} satır; tek kez görülen değerli "
+            f"satır oranı %{tekil_oran * 100:.0f} > TEKIL_SATIR_ESIGI "
+            f"%{TEKIL_SATIR_ESIGI * 100:g}",
+        )
+    if kalan <= KARDINALITE_ESIGI:
+        return (
+            "nadir_toplama",
+            f"{kard}, ama train'deki {n_kat} kategoriden {nadir} tanesi "
+            f"{nadir_esik} altında",
+            f"toplama sonrası {kalan} kategori kaldı (<= eşik "
+            f"{KARDINALITE_ESIGI}), one-hot makul",
+        )
+    return (
+        "frekans",
+        f"{kard}; train'deki {n_kat} kategoriden sadece {nadir} tanesi "
+        f"{nadir_esik} altında, toplama yetmiyor",
+        f"toplama sonrası {kalan} kategori > eşik {KARDINALITE_ESIGI}; "
+        f"frequency encoding kolon başına tek sayısal kolon üretir",
+    )
+
+
+@dataclass
+class _KatkiOlcumu:
+    "Bir kolonun train icinde CV ile olculen katkisi."
+    metrik: str
+    model_kolonlu: str
+    model_kolonsuz: str
+    kolonlu: tuple[float, float]      # (cv ortalama, cv std)
+    kolonsuz: tuple[float, float]
+    sure_sn: float
+
+    @property
+    def fark(self) -> float:
+        return self.kolonlu[0] - self.kolonsuz[0]
+
+    @property
+    def referans(self) -> float:
+        "Iki surumun havuzlanmis fold oynakligi."
+        return math.sqrt((self.kolonlu[1] ** 2 + self.kolonsuz[1] ** 2) / 2)
+
+    @property
+    def esik(self) -> float:
+        return KATKI_KATSAYISI * self.referans
+
+    @property
+    def anlamli(self) -> bool:
+        return self.fark > self.esik
+
+    def metin(self) -> str:
+        model = self.model_kolonlu
+        if self.model_kolonsuz != self.model_kolonlu:
+            model += f", kolonsuz sürümde özellik yok: {self.model_kolonsuz}"
+        return (
+            f"CV ({model}, {self.metrik}): kolonlu {self.kolonlu[0]:.3f} vs "
+            f"kolonsuz {self.kolonsuz[0]:.3f}, fark {self.fark:+.3f} "
+            f"{'>' if self.anlamli else '<='} oynaklık eşiği {self.esik:.3f} "
+            f"(KATKI_KATSAYISI {KATKI_KATSAYISI:g} × ±{self.referans:.3f})"
+        )
+
+
+def _cv_skoru(pl: PreprocessingPlan, X, y,
+              p: DataProfile) -> tuple[str, float, float]:
+    """Plandaki ozelliklerle referans modelin CV skoru: (model, ort, std).
+
+    On isleme model ile ayni Pipeline'da: her fold'da SADECE o fold'un
+    train kisminda fit edilir. Ozellik yoksa hicbir sey ogrenmeyen
+    Baseline olculur.
+    """
+    ozellikler = (pl.numeric_cols + pl.categorical_cols
+                  + pl.nadir_toplama_cols + pl.frekans_cols)
+    havuz = _candidate_models(p.task_type, p.n_rows)
+    if ozellikler:
+        ad = ("LinearRegression" if p.task_type == "regression"
+              else "LogisticRegression")
+        model = Pipeline([("hazirlik", pipeline_kur(pl)),
+                          ("model", havuz[ad])])
+    else:
+        ad = "Baseline"
+        model = havuz[ad]
+    skorlar = cross_val_score(model, X, y, cv=_cv_bolucu(p.task_type, y),
+                              scoring=ana_metrik(p))
+    return ad, float(np.mean(skorlar)), float(np.std(skorlar))
+
+
+def _katki_olc(kolon: str, strateji: KararTipi, taban: PreprocessingPlan,
+               X_train, y_train, p: DataProfile) -> _KatkiOlcumu:
+    """Kolonu dahil eden ve etmeyen iki surumu train icinde CV ile olcer.
+
+    SADECE X_train / y_train kullanilir; test seti hic gorulmez. Kolon,
+    tutulursa alacagi stratejiyle kodlanir. Varsayilan on isleme (median,
+    most_frequent, PCA yok) kullanilir ki olcum iterasyon stratejisinden
+    bagimsiz ve her iterasyonda ayni olsun.
+    """
+    baslangic = time.perf_counter()
+    alan = {"nadir_toplama": "nadir_toplama_cols",
+            "frekans": "frekans_cols"}[strateji]
+    kolonlu = taban.model_copy(update={alan: [kolon]})
+    ad_ile, ort_ile, std_ile = _cv_skoru(kolonlu, X_train, y_train, p)
+    ad_siz, ort_siz, std_siz = _cv_skoru(taban, X_train, y_train, p)
+    return _KatkiOlcumu(
+        metrik=ana_metrik(p), model_kolonlu=ad_ile, model_kolonsuz=ad_siz,
+        kolonlu=(ort_ile, std_ile), kolonsuz=(ort_siz, std_siz),
+        sure_sn=time.perf_counter() - baslangic,
+    )
+
+
+STRATEJI_ADLARI = {"nadir_toplama": "nadir toplama + onehot",
+                   "frekans": "frequency encoding"}
+
+
+def _katkiya_gore_kesinlestir(gecici: ColumnDecision, c: ColumnProfile,
+                              taban: PreprocessingPlan, state: RunState,
+                              p: DataProfile) -> ColumnDecision:
+    "Strateji secilmis kolonu, CV'deki katkisina gore tutar ya da atar."
+    if state.y_train is None:
+        return gecici     # hedef yok (clustering): katki olculemez
+    olcum = _katki_olc(c.name, gecici.decision, taban, state.X_train,
+                       state.y_train, p)
+    print(f"    katki olcumu: {c.name} -> "
+          f"{'tutuldu' if olcum.anlamli else 'atildi'} "
+          f"(fark {olcum.fark:+.3f}, esik {olcum.esik:.3f}, "
+          f"{olcum.sure_sn:.2f} sn)")
+
+    if olcum.anlamli:
+        return gecici.model_copy(update={
+            "reason": f"{gecici.reason}; katkısı train içinde CV ile "
+                      f"ölçüldü, sinyal taşıyor",
+            "trigger": f"{olcum.metin()}; {gecici.trigger}",
+        })
+    return gecici.model_copy(update={
+        "decision": "drop",
+        "reason": f"{c.n_unique} kategori > eşik {KARDINALITE_ESIGI}; "
+                  f"katkısı train içinde CV ile ölçüldü "
+                  f"({STRATEJI_ADLARI[gecici.decision]} ile kodlanarak)",
+        "trigger": f"{olcum.metin()} — sinyal taşımıyor",
+    })
+
+
 def plan(state: RunState) -> RunState:
     "Profile bakarak preprocessing kararlarini otomatik uretir."
     p = state.profile
@@ -80,8 +281,14 @@ def plan(state: RunState) -> RunState:
 
     numeric_cols = []
     categorical_cols = []
+    nadir_toplama_cols = []
+    frekans_cols = []
     drop_cols = []
     kararlar: list[ColumnDecision] = []
+    # Strateji secilmis ama katkisi henuz olculmemis yuksek kardinaliteli
+    # kolonlar: (kararlar icindeki sira, profil). Taban ozellikler dongu
+    # bitince belli olur, olcum oradan sonra yapilir.
+    bekleyenler: list[tuple[int, ColumnProfile]] = []
 
     # Esik metinleri tek yerde uretilir, her gerekcede ayni sekilde gecer.
     null_esik_metni = f"eşik %{NULL_ESIGI*100:.0f}"
@@ -130,13 +337,19 @@ def plan(state: RunState) -> RunState:
 
         if (c.inferred_type == "categorical"
                 and c.n_unique > KARDINALITE_ESIGI):
-            drop_cols.append(c.name)
-            notes.append(f"{c.name}: {c.n_unique} essiz kategori, atildi")
+            # Uc durum CV'ye gitmeden atilir; digerleri icin strateji
+            # secilir, tutulup tutulmayacagi katki olcumunde kesinlesir.
+            karar, sebep, tetik = _yuksek_kardinalite_karari(c,
+                                                             state.X_train)
+            if karar == "drop":
+                drop_cols.append(c.name)
+                notes.append(f"{c.name}: {c.n_unique} essiz kategori, "
+                             f"neredeyse her satir farkli, atildi")
+            else:
+                bekleyenler.append((len(kararlar), c))
             kararlar.append(ColumnDecision(
-                name=c.name, inferred_type=c.inferred_type, decision="drop",
-                reason="kardinalite çok yüksek, one-hot kodlama boyutu "
-                       "patlatır ve model seyrek veriye boğulur",
-                trigger=f"{c.n_unique} eşsiz kategori > {kard_esik_metni}",
+                name=c.name, inferred_type=c.inferred_type, decision=karar,
+                reason=sebep, trigger=tetik,
             ))
             continue
 
@@ -177,6 +390,21 @@ def plan(state: RunState) -> RunState:
                 trigger=f"{c.n_unique} eşsiz değer, kardinalite "
                         f"{kard_esik_metni} altında",
             ))
+
+    # Yuksek kardinaliteli kolonlarin katkisi: her biri ayni tabana (dusuk
+    # kardinaliteli ozellikler) karsi, birbirinden bagimsiz olculur.
+    taban = PreprocessingPlan(numeric_cols=list(numeric_cols),
+                              categorical_cols=list(categorical_cols))
+    for sira, c in bekleyenler:
+        karar = _katkiya_gore_kesinlestir(kararlar[sira], c, taban, state, p)
+        kararlar[sira] = karar
+        {"drop": drop_cols, "nadir_toplama": nadir_toplama_cols,
+         "frekans": frekans_cols}[karar.decision].append(c.name)
+        notes.append(f"{c.name}: {c.n_unique} essiz kategori, "
+                     f"karar={karar.decision}")
+    # Sonradan atilan kolonlar da veri setindeki sirada dursun.
+    kolon_sirasi = {c.name: i for i, c in enumerate(p.columns)}
+    drop_cols.sort(key=lambda ad: kolon_sirasi[ad])
 
     use_pca = (len(numeric_cols) > PCA_KOLON_ESIGI
                and p.n_rows > PCA_SATIR_ESIGI)
@@ -238,6 +466,8 @@ def plan(state: RunState) -> RunState:
     state.plan = PreprocessingPlan(
         numeric_cols=numeric_cols,
         categorical_cols=categorical_cols,
+        nadir_toplama_cols=nadir_toplama_cols,
+        frekans_cols=frekans_cols,
         drop_cols=drop_cols,
         numeric_imputation=numeric_imputation,
         categorical_imputation=categorical_imputation,
@@ -280,6 +510,8 @@ def _profil_ozeti(p: DataProfile, kural_plan: PreprocessingPlan) -> str:
         "Kural-tabanli planin onerisi:",
         f"  numeric_cols: {kural_plan.numeric_cols}",
         f"  categorical_cols: {kural_plan.categorical_cols}",
+        f"  nadir_toplama_cols: {kural_plan.nadir_toplama_cols}",
+        f"  frekans_cols: {kural_plan.frekans_cols}",
         f"  drop_cols: {kural_plan.drop_cols}",
         f"  numeric_imputation: {kural_plan.numeric_imputation}",
         f"  categorical_imputation: {kural_plan.categorical_imputation}",
@@ -290,7 +522,9 @@ def _profil_ozeti(p: DataProfile, kural_plan: PreprocessingPlan) -> str:
         "",
         "Bu profile bakarak preprocessing planini JSON olarak dondur. "
         "Sadece JSON dondur, baska aciklama yazma. Alanlar: numeric_cols, "
-        "categorical_cols, drop_cols, numeric_imputation, "
+        "categorical_cols, nadir_toplama_cols (nadir kategorileri toplanip "
+        "one-hot), frekans_cols (frequency encoding), drop_cols, "
+        "numeric_imputation, "
         "categorical_imputation, scaling, encoding, use_pca, n_components, "
         "notes. Kolon adlarini AYNEN yukaridaki listeden kullan, yeni kolon "
         "adi uydurma. Hedef kolonu ozellik listelerine koyma.",
@@ -343,12 +577,14 @@ def _kolonlar_gecerli(oneri: PreprocessingPlan, p: DataProfile) -> bool:
     "LLM'in onerdigi kolon adlari gercekten veride var mi?"
     gecerli = {c.name for c in p.columns if c.name != p.target}
     onerilen = (oneri.numeric_cols + oneri.categorical_cols
+                + oneri.nadir_toplama_cols + oneri.frekans_cols
                 + oneri.drop_cols)
     for ad in onerilen:
         if ad not in gecerli:
             print(f"   ! LLM uydurma kolon adi verdi: {ad!r}, plan reddedildi")
             return False
-    if not oneri.numeric_cols and not oneri.categorical_cols:
+    if not (oneri.numeric_cols or oneri.categorical_cols
+            or oneri.nadir_toplama_cols or oneri.frekans_cols):
         print("   ! LLM bos ozellik listesi verdi, plan reddedildi")
         return False
     return True
@@ -362,11 +598,15 @@ def _gerekceleri_devret(oneri: PreprocessingPlan,
     planin gerekcesi korunur; LLM farkli karar verdiyse bu acikca yazilir,
     gerekce uydurulmaz.
     """
-    llm_karari: dict[str, str] = {}
+    llm_karari: dict[str, KararTipi] = {}
     for ad in oneri.numeric_cols:
         llm_karari[ad] = "numeric"
     for ad in oneri.categorical_cols:
         llm_karari[ad] = "categorical"
+    for ad in oneri.nadir_toplama_cols:
+        llm_karari[ad] = "nadir_toplama"
+    for ad in oneri.frekans_cols:
+        llm_karari[ad] = "frekans"
     for ad in oneri.drop_cols:
         llm_karari[ad] = "drop"
 
