@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict
 # boylece tip denetleyicisi "str -> Literal" uyusmazligi vermez.
 InferredType = Literal["numeric", "categorical", "text", "datetime"]
 TaskType = Literal["classification", "regression", "clustering"]
+# Bir kolon hakkinda verilebilecek kararlar: atildi, hangi pipeline'a gitti
+# ya da hedef kolon oldugu icin ozellik listelerine hic girmedi.
+KararTipi = Literal["drop", "numeric", "categorical", "target"]
 
 
 class _Strict(BaseModel):
@@ -45,6 +48,19 @@ class DataProfile(_Strict):
     high_correlations: list[tuple[str, str, float]] = []
 
 
+class ColumnDecision(_Strict):
+    """Tek bir kolon icin verilen karar ve GEREKCESI.
+
+    Karar mantigi planner'da; bu kayit sadece "ne yapildi, neden yapildi,
+    hangi deger tetikledi" uclusunu saklar ki terminale basilabilsin.
+    """
+    name: str
+    inferred_type: InferredType
+    decision: KararTipi
+    reason: str            # insan okuyabilir gerekce cumlesi
+    trigger: str = ""      # tetikleyen deger + karsilastirilan esik
+
+
 class PreprocessingPlan(BaseModel):
     numeric_cols: list[str] = []
     categorical_cols: list[str] = []
@@ -56,6 +72,10 @@ class PreprocessingPlan(BaseModel):
     use_pca: bool = False
     n_components: Optional[int] = None
     notes: list[str] = []
+    # Karar gerekceleri: mevcut alanlarin yanina eklenir, onlari degistirmez.
+    column_decisions: list[ColumnDecision] = []
+    pca_reason: str = ""
+    step_reasons: dict[str, str] = {}
 
 class ModelScore(BaseModel):
     name: str

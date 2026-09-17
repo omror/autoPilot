@@ -2,12 +2,54 @@
 from automl import llm
 from automl.agents.base import Agent
 from automl.memory.store import benzer_runlar
-from automl.schemas import DataProfile, PreprocessingPlan, RunState
+from automl.schemas import (ColumnDecision, DataProfile, PreprocessingPlan,
+                            RunState)
 
 SYSTEM_PROMPT = (
     "Sen bir ML preprocessing uzmanisin. Verilen veri profiline bakarak "
     "preprocessing kararlari oner."
 )
+
+# Karar esikleri: hem karsilastirmada hem gerekce metninde ayni sabit
+# kullanilir, boylece basilan esik koddan sapamaz.
+NULL_ESIGI = 0.5          # bu oranin ustunde null olan kolon atilir
+KARDINALITE_ESIGI = 50    # bundan fazla essiz kategorili kolon atilir
+PCA_KOLON_ESIGI = 10      # bundan fazla sayisal kolon varsa PCA aday
+PCA_SATIR_ESIGI = 50      # PCA icin gereken en az satir sayisi
+
+# Imputation / scaling / encoding secimlerinin gerekceleri.
+ADIM_GEREKCELERI = {
+    "numeric_imputation":
+        "median: aykırı değerlere dayanıklı, ortalamayı kaydırmaz",
+    "categorical_imputation":
+        "most_frequent: kategorikte ortalama yok, en sık değer en az "
+        "bilgi bozar",
+    "scaling":
+        "standard: kolonlar farklı ölçeklerde, mesafe ve gradyan tabanlı "
+        "modeller ölçeğe duyarlı",
+    "encoding":
+        "onehot: kategoriler ordinal değil, sayı vermek modele yanlış "
+        "sıralama öğretir",
+}
+
+
+def _pca_gerekcesi(n_sayisal: int, n_satir: int, use_pca: bool,
+                   n_components: int | None) -> str:
+    "PCA'nin neden acildigini/kapandigini tetikleyen degerlerle anlatir."
+    if use_pca:
+        return (f"açıldı ({n_components} bileşene indirildi) — "
+                f"{n_sayisal} sayısal kolon > eşik {PCA_KOLON_ESIGI}, "
+                f"{n_satir} satır > eşik {PCA_SATIR_ESIGI}")
+
+    # Kapaliysa hangi kosul(lar) tutmadi, tek tek yaz.
+    sebepler = []
+    if n_sayisal <= PCA_KOLON_ESIGI:
+        sebepler.append(f"{n_sayisal} sayısal kolon, eşik "
+                        f"{PCA_KOLON_ESIGI}'un üzerinde değil")
+    if n_satir <= PCA_SATIR_ESIGI:
+        sebepler.append(f"{n_satir} satır, eşik "
+                        f"{PCA_SATIR_ESIGI}'nin üzerinde değil")
+    return "kapalı — " + "; ".join(sebepler)
 
 
 def plan(state: RunState) -> RunState:
@@ -21,38 +63,95 @@ def plan(state: RunState) -> RunState:
     numeric_cols = []
     categorical_cols = []
     drop_cols = []
+    kararlar: list[ColumnDecision] = []
+
+    # Esik metinleri tek yerde uretilir, her gerekcede ayni sekilde gecer.
+    null_esik_metni = f"eşik %{NULL_ESIGI*100:.0f}"
+    kard_esik_metni = f"eşik {KARDINALITE_ESIGI}"
 
     for c in p.columns:
         if c.name == p.target:
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type,
+                decision="target",
+                reason="hedef kolon, özellik değil — tahmin edilen değer, "
+                       "modele girdi olarak verilmez",
+                trigger=f"görev tipi {p.task_type}",
+            ))
             continue
 
-        if c.null_ratio > 0.5:
+        if c.null_ratio > NULL_ESIGI:
             drop_cols.append(c.name)
             notes.append(f"{c.name}: %{c.null_ratio*100:.0f} bos, atildi")
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type, decision="drop",
+                reason="eksik değer oranı çok yüksek, güvenilir doldurma "
+                       "yapılamaz",
+                trigger=f"null oranı %{c.null_ratio*100:.0f} > "
+                        f"{null_esik_metni}",
+            ))
             continue
 
         if c.inferred_type in ("text", "datetime"):
             drop_cols.append(c.name)
             notes.append(f"{c.name}: {c.inferred_type} tipi, atildi")
+            if c.inferred_type == "text":
+                sebep = ("serbest metin, özellik çıkarımı olmadan modele "
+                         "giremez")
+                tetik = (f"tip=text, {c.n_unique} eşsiz değer / "
+                         f"{p.n_rows} satır")
+            else:
+                sebep = ("tarih kolonu, özellik çıkarımı (yıl/ay/gün) "
+                         "olmadan modele giremez")
+                tetik = f"tip=datetime, dtype={c.dtype}"
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type, decision="drop",
+                reason=sebep, trigger=tetik,
+            ))
             continue
 
-        if c.inferred_type == "categorical" and c.n_unique > 50:
+        if (c.inferred_type == "categorical"
+                and c.n_unique > KARDINALITE_ESIGI):
             drop_cols.append(c.name)
             notes.append(f"{c.name}: {c.n_unique} essiz kategori, atildi")
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type, decision="drop",
+                reason="kardinalite çok yüksek, one-hot kodlama boyutu "
+                       "patlatır ve model seyrek veriye boğulur",
+                trigger=f"{c.n_unique} eşsiz kategori > {kard_esik_metni}",
+            ))
             continue
 
         if c.inferred_type == "numeric":
             numeric_cols.append(c.name)
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type,
+                decision="numeric",
+                reason="sayısal tip, sayısal pipeline'a gider",
+                trigger=f"null oranı %{c.null_ratio*100:.0f}, "
+                        f"{null_esik_metni} altında",
+            ))
         else:
             categorical_cols.append(c.name)
+            kararlar.append(ColumnDecision(
+                name=c.name, inferred_type=c.inferred_type,
+                decision="categorical",
+                reason="kategorik tip, kategorik pipeline'a gider",
+                trigger=f"{c.n_unique} eşsiz değer, kardinalite "
+                        f"{kard_esik_metni} altında",
+            ))
 
-    use_pca = len(numeric_cols) > 10 and p.n_rows > 50
+    use_pca = (len(numeric_cols) > PCA_KOLON_ESIGI
+               and p.n_rows > PCA_SATIR_ESIGI)
     n_components = min(10, len(numeric_cols)) if use_pca else None
     if use_pca:
         notes.append(f"{len(numeric_cols)} sayisal kolon icin PCA acildi")
+    pca_reason = _pca_gerekcesi(len(numeric_cols), p.n_rows, use_pca,
+                                n_components)
 
     numeric_imputation = "median"
     categorical_imputation = "most_frequent"
+    step_reasons = dict(ADIM_GEREKCELERI)
 
     # Strateji katmani: "varsayilan" disinda kurallari oynatir.
     # Onceki iterasyon eşigi gecemediyse orchestrator strateji degistirir.
@@ -61,6 +160,11 @@ def plan(state: RunState) -> RunState:
             use_pca = False
             n_components = None
             notes.append("strateji: PCA kapatildi (tersine cevrildi)")
+            pca_reason = (
+                f"strateji 'pca_ters': kural PCA'yı açmıştı "
+                f"({len(numeric_cols)} sayısal kolon), önceki iterasyon "
+                f"eşiği geçemediği için tersine çevrilip kapatıldı"
+            )
         elif len(numeric_cols) >= 2:
             use_pca = True
             n_components = min(10, len(numeric_cols))
@@ -68,13 +172,31 @@ def plan(state: RunState) -> RunState:
                 f"strateji: PCA acildi (tersine cevrildi, "
                 f"n_components={n_components})"
             )
+            pca_reason = (
+                f"strateji 'pca_ters': kural PCA'yı kapatmıştı, önceki "
+                f"iterasyon eşiği geçemediği için tersine çevrilip açıldı; "
+                f"{n_components} bileşene indirildi"
+            )
         else:
             notes.append("strateji: PCA acilamadi, yeterli sayisal kolon yok")
+            pca_reason = (
+                f"strateji 'pca_ters': PCA açılmak istendi ama "
+                f"{len(numeric_cols)} sayısal kolon ile açılamaz "
+                f"(en az 2 gerekir)"
+            )
     elif state.strateji == "imputation_degis":
         numeric_imputation = "mean"
         categorical_imputation = "constant"
         notes.append("strateji: imputation median->mean, "
                      "most_frequent->constant")
+        step_reasons["numeric_imputation"] = (
+            "mean: strateji 'imputation_degis' önceki iterasyon eşiği "
+            "geçemediği için medyan yerine ortalamayı denedi"
+        )
+        step_reasons["categorical_imputation"] = (
+            "constant: strateji 'imputation_degis' en sık değer yerine "
+            "sabit değer atamayı denedi"
+        )
 
     state.plan = PreprocessingPlan(
         numeric_cols=numeric_cols,
@@ -87,6 +209,9 @@ def plan(state: RunState) -> RunState:
         use_pca=use_pca,
         n_components=n_components,
         notes=notes,
+        column_decisions=kararlar,
+        pca_reason=pca_reason,
+        step_reasons=step_reasons,
     )
     return state
 
@@ -192,6 +317,48 @@ def _kolonlar_gecerli(oneri: PreprocessingPlan, p: DataProfile) -> bool:
     return True
 
 
+def _gerekceleri_devret(oneri: PreprocessingPlan,
+                        kural: PreprocessingPlan) -> None:
+    """LLM plani kabul edilince karar gerekcelerini ona tasir.
+
+    LLM gerekce uretmiyor (prompt'ta bu alanlar istenmiyor). Kural-tabanli
+    planin gerekcesi korunur; LLM farkli karar verdiyse bu acikca yazilir,
+    gerekce uydurulmaz.
+    """
+    llm_karari: dict[str, str] = {}
+    for ad in oneri.numeric_cols:
+        llm_karari[ad] = "numeric"
+    for ad in oneri.categorical_cols:
+        llm_karari[ad] = "categorical"
+    for ad in oneri.drop_cols:
+        llm_karari[ad] = "drop"
+
+    yeni: list[ColumnDecision] = []
+    for k in kural.column_decisions:
+        if k.decision == "target":
+            yeni.append(k)          # hedef kolon LLM'in kararina tabi degil
+            continue
+        # LLM kolonu hic anmadiysa ozellik listesine girmemis demektir.
+        karar = llm_karari.get(k.name, "drop")
+        if karar == k.decision:
+            yeni.append(k)
+            continue
+        yeni.append(k.model_copy(update={
+            "decision": karar,
+            "reason": (f"LLM önerisi kural kararının ({k.decision}) yerine "
+                       f"bunu seçti; kural gerekçesi: {k.reason}"),
+            "trigger": k.trigger,
+        }))
+
+    oneri.column_decisions = yeni
+    oneri.pca_reason = (
+        f"LLM planı: use_pca={oneri.use_pca} "
+        f"(n_components={oneri.n_components}); "
+        f"kural gerekçesi -> {kural.pca_reason}"
+    )
+    oneri.step_reasons = dict(kural.step_reasons)
+
+
 class PlannerAgent(Agent):
     """Preprocessing planini uretir."""
 
@@ -223,6 +390,7 @@ class PlannerAgent(Agent):
         # 4) Gecerliyse LLM planini kullan, degilse kural-tabanliya dus.
         if oneri is not None and _kolonlar_gecerli(oneri, p):
             oneri.notes.append("LLM onerisi kullanildi")
+            _gerekceleri_devret(oneri, kural_plan)
             state.plan = oneri
         else:
             kural_plan.notes.append("kural-tabanli plan kullanildi")

@@ -82,6 +82,64 @@ def test_iterasyon_kaydi_tutuluyor(messy_state):
     assert denemeler[0]["strateji"] == "varsayilan"
 
 
+def test_her_kolon_icin_gerekce_kaydi_var(messy_state):
+    "Hedef dahil her kolon icin karar + gerekce kaydedilmeli."
+    pl, p = messy_state.plan, messy_state.profile
+    kararlar = pl.column_decisions
+    assert len(kararlar) == p.n_cols
+    assert {k.name for k in kararlar} == {c.name for c in p.columns}
+    for k in kararlar:
+        assert k.reason, f"{k.name}: gerekce bos"
+        assert k.trigger, f"{k.name}: tetikleyen deger bos"
+
+
+def test_drop_gerekceleri_tetiklenen_kurali_gosteriyor(messy_state):
+    """Atilan her kolonun gerekcesi hangi kuralin tetiklendigini soylemeli.
+
+    Dikkat: kayit_tarihi datetime olarak parse EDILMIYOR (loader tarih
+    cevirmiyor, kolon str kaliyor). 400 essiz string oldugu icin TEXT
+    kuraliyla atiliyor. Yani messy.csv'de 3 ayri drop kurali tetiklenir:
+    null orani, serbest metin (2 kolon) ve kardinalite.
+    """
+    atilanlar = {k.name: k for k in messy_state.plan.column_decisions
+                 if k.decision == "drop"}
+    assert set(atilanlar) == {"bos_kolon", "urun_kodu", "kayit_tarihi",
+                              "aciklama"}
+
+    # Tetikleyen deger gercekten esikle birlikte yaziliyor mu?
+    assert "%100" in atilanlar["bos_kolon"].trigger
+    assert "%50" in atilanlar["bos_kolon"].trigger
+    assert "60 eşsiz kategori" in atilanlar["urun_kodu"].trigger
+    assert "50" in atilanlar["urun_kodu"].trigger
+
+    # Metin kuraliyla atilanlar tipini de gerekcesini de metin olarak verir.
+    for ad in ("kayit_tarihi", "aciklama"):
+        assert atilanlar[ad].inferred_type == "text"
+        assert "metin" in atilanlar[ad].reason
+
+    sebepler = {k.reason for k in atilanlar.values()}
+    assert len(sebepler) == 3, f"sebepler ayrismamis: {sebepler}"
+
+
+def test_hedef_kolon_ayri_isaretli(messy_state):
+    "Hedef kolon atilmis gibi degil, 'hedef' olarak kaydedilmeli."
+    hedef = [k for k in messy_state.plan.column_decisions
+             if k.decision == "target"]
+    assert len(hedef) == 1
+    assert hedef[0].name == "hedef"
+
+
+def test_pca_ve_adim_gerekceleri_dolu(messy_state):
+    "PCA karari ve imputation/scaling/encoding secimleri gerekceli olmali."
+    pl = messy_state.plan
+    assert pl.pca_reason
+    assert set(pl.step_reasons) == {"numeric_imputation",
+                                    "categorical_imputation",
+                                    "scaling", "encoding"}
+    assert pl.step_reasons["numeric_imputation"].startswith(
+        pl.numeric_imputation)
+
+
 def test_donusturulmus_veride_nan_kalmadi(messy_state):
     "Imputation sonrasi egitime giren matriste NaN olmamali."
     import numpy as np

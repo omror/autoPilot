@@ -1,6 +1,8 @@
 import argparse
+import textwrap
 import time
-from automl.schemas import RunState
+from automl.schemas import (ColumnDecision, ColumnProfile, DataProfile,
+                            PreprocessingPlan, RunState)
 from automl.agents.loader import LoaderAgent
 from automl.agents.profiler import ProfilerAgent
 from automl.agents.splitter import SplitterAgent
@@ -49,6 +51,125 @@ def _goruntu_yukle(state: RunState, goruntu: dict) -> None:
     "Saklanan iterasyon sonucunu state'e geri yazar."
     for alan, deger in goruntu.items():
         setattr(state, alan, deger)
+
+
+# Gruplu listede en fazla kac kolon adi basilir (tam liste PLAN bolumunde).
+GRUP_KOLON_LIMITI = 15
+
+
+def _etiketli_yaz(etiket: str, metin: str) -> None:
+    "Uzun gerekceleri terminalde tasmayacak sekilde sararak basar."
+    bas = f"    {etiket} : "
+    print(textwrap.fill(metin, width=76, initial_indent=bas,
+                        subsequent_indent=" " * len(bas)))
+
+
+def _kolon_notu(karar: ColumnDecision, c: ColumnProfile | None) -> str:
+    """Gruplu listede kolon adinin yanina yazilacak dikkat cekici deger.
+
+    Sadece bilgi veren durumda parantez acilir: sayisalda eksik veri varsa,
+    kategorikte essiz deger sayisi.
+    """
+    if c is None:
+        return karar.name
+    if karar.decision == "numeric":
+        if c.null_ratio > 0:
+            return f"{karar.name} (null %{c.null_ratio*100:.0f})"
+        return karar.name
+    return f"{karar.name} ({c.n_unique} eşsiz)"
+
+
+def _grup_yaz(baslik: str, islem: str, kararlar: list[ColumnDecision],
+              profil: dict[str, ColumnProfile]) -> None:
+    "Ayni karari alan kolonlari tek blok halinde basar."
+    print(f"  {baslik} ({len(kararlar)} kolon)")
+    # Ayni gruptaki kolonlarin gerekcesi normalde aynidir; farkli gerekce
+    # varsa (LLM karari) hepsi ayri satirda gorunsun.
+    for sebep in dict.fromkeys(k.reason for k in kararlar):
+        _etiketli_yaz("sebep", sebep)
+    _etiketli_yaz("işlem", islem)
+
+    adlar = [_kolon_notu(k, profil.get(k.name))
+             for k in kararlar[:GRUP_KOLON_LIMITI]]
+    kalan = len(kararlar) - len(adlar)
+    if kalan > 0:
+        adlar.append(f"... ve {kalan} kolon daha")
+    print(textwrap.fill(", ".join(adlar), width=76,
+                        initial_indent="    kolonlar: ",
+                        subsequent_indent="              "))
+
+
+def _preprocessing_kararlari_yaz(pl: PreprocessingPlan,
+                                 p: DataProfile) -> None:
+    "Her kolon icin verilen karari, gerekcesini ve tetikleyen degeri basar."
+    print("\n--- PREPROCESSING KARARLARI ---")
+    profil = {c.name: c for c in p.columns}
+
+    if not pl.column_decisions:
+        print("  (kolon karar kaydı yok)")
+    else:
+        kararlar = pl.column_decisions
+        atilanlar = [k for k in kararlar if k.decision == "drop"]
+        sayisallar = [k for k in kararlar if k.decision == "numeric"]
+        kategorikler = [k for k in kararlar if k.decision == "categorical"]
+        hedefler = [k for k in kararlar if k.decision == "target"]
+
+        # Atilanlar tek tek: her birinin sebebi farkli olabilir.
+        if atilanlar:
+            print(f"\nATILAN KOLONLAR ({len(atilanlar)} kolon)")
+            for k in atilanlar:
+                print(f"  {k.name[:20]:20} [{k.inferred_type}]  ATILDI")
+                _etiketli_yaz("sebep", k.reason)
+                _etiketli_yaz("tetik", k.trigger)
+        else:
+            print("\nATILAN KOLONLAR: yok, tum ozellikler kullanildi")
+
+        # Tutulanlar gruplu: 30 kolonlu veride ekrani bogmasin.
+        print(f"\nTUTULAN KOLONLAR "
+              f"({len(sayisallar) + len(kategorikler)} kolon)")
+        if sayisallar:
+            _grup_yaz("sayısal pipeline",
+                      f"{pl.numeric_imputation} imputation + "
+                      f"{pl.scaling} scaling",
+                      sayisallar, profil)
+        if kategorikler:
+            _grup_yaz("kategorik pipeline",
+                      f"{pl.categorical_imputation} imputation + "
+                      f"{pl.encoding} encoding",
+                      kategorikler, profil)
+
+        if hedefler:
+            print("\nHEDEF KOLON")
+            for k in hedefler:
+                print(f"  {k.name[:20]:20} [{k.inferred_type}]")
+                _etiketli_yaz("sebep", k.reason)
+                _etiketli_yaz("tetik", k.trigger)
+
+    # Bu veride hic kullanilmayan adimin gerekcesi basilmaz.
+    atlanacak = set()
+    if not pl.numeric_cols:
+        atlanacak |= {"numeric_imputation", "scaling"}
+    if not pl.categorical_cols:
+        atlanacak |= {"categorical_imputation", "encoding"}
+    gerekceler = {ad: g for ad, g in pl.step_reasons.items()
+                  if ad not in atlanacak}
+
+    if gerekceler:
+        print("\nADIM GEREKÇELERİ")
+        for adim, gerekce in gerekceler.items():
+            print(textwrap.fill(
+                gerekce, width=76,
+                initial_indent=f"  {adim:22} : ",
+                subsequent_indent=" " * 27))
+
+    print("\nÖZET")
+    print(f"  kolonlar: {len(pl.numeric_cols) + len(pl.categorical_cols)} "
+          f"tutuldu ({len(pl.numeric_cols)} sayısal + "
+          f"{len(pl.categorical_cols)} kategorik), "
+          f"{len(pl.drop_cols)} atıldı")
+    print(textwrap.fill(pl.pca_reason or "-", width=76,
+                        initial_indent="  PCA     : ",
+                        subsequent_indent=" " * 12))
 
 
 def run(data_path: str, target: str | None = None,
@@ -188,6 +309,8 @@ def run(data_path: str, target: str | None = None,
     print(f"PCA       : {pl.use_pca} ({pl.n_components})")
     for n in pl.notes:
         print(f"  not: {n}")
+
+    _preprocessing_kararlari_yaz(pl, p)
 
     print("\n--- PREPROCESS ---")
     print(f"X_train: {state.X_train.shape} -> {state.X_train_t.shape}")
